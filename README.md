@@ -45,7 +45,6 @@ Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 | File | What it is |
 |---|---|
 | `Update-VeeamPostgres.ps1` | The script. **The only file your RMM needs** |
-| `VeeamPostgresUpdate.config.example.json` | Optional per-server override. You don't need it |
 | `Test-Helpers.ps1` | Unit tests. Run after any edit |
 
 The settings are built into the script, so an RMM that uploads just the one file to a
@@ -136,9 +135,8 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | `-Install` | off | Actually do the update. Without it, audit only |
 | `-Reboot` | off | Compatibility switch only. It is accepted but safely deferred to the RMM; the script never invokes shutdown |
 | `-Recover` | off | Validate and restore captured state from an interrupted pre-installer run; post-installer use is diagnostic-only |
-| `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Logs and recovery evidence, including dumps and the cold copy |
+| `-WorkRoot` | `C:\temp\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
 | `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed |
-| `-ConfigPath` | none | Rarely needed. A settings override file somewhere unusual |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
 RMM script or policy. The independent RMM owns the maintenance window, retries, reboot,
@@ -178,8 +176,9 @@ running. On those servers, invoke `pwsh.exe` instead of `powershell.exe`.
 
 ## Settings and version policy
 
-The configurable settings live **inside the script**, near the top, under the banner
-`BUILT-IN SETTINGS - EDIT THESE`. Edit there, then re-upload the script to your RMM.
+The configurable settings live **only inside the script**, near the top, under the banner
+`BUILT-IN SETTINGS - EDIT THESE`. Edit there, review the change, then re-upload the script
+to your RMM. There is no `-ConfigPath` parameter and no external settings file is read.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -203,10 +202,10 @@ return an EOL code until the server is migrated to a supported major. If the ins
 version is already equal to or newer than the target, it never downgrades PostgreSQL.
 
 The former `approvedTargets`, `supportedBranches`, and `branchFloors` settings have been
-removed. If an old override file still contains them, the script warns and ignores them.
-New PostgreSQL minors are therefore selected automatically; they are no longer held for
-a manual allow-list edit. Review PostgreSQL release notes and pilot normal RMM rollout,
-because an unusual minor release can still require a follow-up action such as `REINDEX`.
+removed. New PostgreSQL minors are therefore selected automatically; they are no longer
+held for a manual allow-list edit. Review PostgreSQL release notes and pilot normal RMM
+rollout, because an unusual minor release can still require a follow-up action such as
+`REINDEX`.
 
 The removed settings also include `abortIfVeeamOnePresent`,
 `abortIfRemoteVb365Proxies`, and `reapplyTuning`. Those behaviors are no longer operator
@@ -236,18 +235,6 @@ cold data-directory copy, service/job state, tuning and installer logs. Unresolv
 and the two newest completed recovery sets are retained regardless of age; older completed
 sets become eligible for deletion after `retentionDays`. Copy recovery evidence off-host
 if your operational policy requires protection from loss of the Veeam server itself.
-
-### Overriding one server
-
-Need one customer to be different? Don't fork the script. Put a JSON file at
-`C:\ProgramData\VeeamPgUpdate\config.json` containing **only the keys you want to change**.
-See `VeeamPostgresUpdate.config.example.json`.
-
-* Each recognized key you set **replaces** the built-in value.
-* Unknown and removed keys are logged and ignored.
-* It is only used if the file is owned by SYSTEM or Administrators. The script runs as
-  SYSTEM, so it will not take settings from a file an ordinary user could have planted.
-  If your RMM drops the file there, it will be owned correctly.
 
 ### Job and restore handling
 
@@ -381,9 +368,8 @@ persistent EOL result `7`.
 ## Where the evidence lives
 
 ```
-C:\ProgramData\VeeamPgUpdate\
+C:\temp\VeeamPgUpdate\
   CHANGES-IN-PROGRESS.marker   present only mid-change, or after a run that needs a human
-  config.json                  optional per-server settings override
   .veeam-pg-updater            marks the folder as created by the script
   logs\
     VeeamPgUpdate_<server>_<timestamp>.log   full transcript
@@ -395,6 +381,7 @@ C:\ProgramData\VeeamPgUpdate\
       globals.sql            roles and grants
       conf\                  the four .conf files from before the update
       datadir\               cold copy of the whole data directory
+      datadir-acl.txt         original data-directory DACLs for a manual restore
       Config.xml             VB365 only
       Proxy.xml              VB365 only; controller and persistent-cache connections
     disabled-jobs.json
@@ -405,14 +392,32 @@ C:\ProgramData\VeeamPgUpdate\
     installer-*.log
 ```
 
-**The whole folder is locked to SYSTEM and Administrators**, every run. The dumps are
-privileged: restoring one runs code chosen by whoever made it. If `-Install` can't lock
-the folder, it refuses to run (`WORKROOT_UNSAFE`, exit 20).
+**The WorkRoot and newly created evidence tree are locked to SYSTEM and Administrators.**
+The cold copy records the source DACLs separately instead of importing them into that tree.
+The dumps are privileged: restoring one runs code chosen by whoever made it. Before writing
+even an audit log, the script verifies the WorkRoot owner and ACL, its parent, the
+`.veeam-pg-updater` sentinel,
+and that no active path component or top-level child is a junction/symbolic link. Recovery
+paths are checked again before use, and a run is recursively checked for reparse points
+before retention can delete it. A marker filename by itself is not trusted. Failure returns
+`WORKROOT_UNSAFE` (exit 20) and writes no file in the rejected location.
 
-**It only locks down or cleans a folder it created itself** (it leaves a
-`.veeam-pg-updater` file inside), or an empty one. Point `-WorkRoot` at a drive root or
-an existing folder full of other things by mistake and the script leaves that folder's
-permissions and contents completely alone, writes its log, and `-Install` refuses.
+On first use, the documented default can securely create `C:\temp` when that directory is
+absent, then creates `C:\temp\VeeamPgUpdate`. If `C:\temp` already exists but a normal user
+can replace its children, the script deliberately leaves it unchanged and refuses to run;
+secure that parent or choose another protected local path. A custom WorkRoot's parent must
+already exist, and every ancestor must be non-reparse and non-replaceable. Existing
+non-empty WorkRoots are used only when they have the exact protected ACL and trusted
+sentinel created by this script.
+An existing empty WorkRoot must already have that exact protected ACL before the script will
+claim it. Drive roots, UNC paths, relative paths, foreign content, forged
+sentinels, and reparse points are rejected without changing their contents or permissions.
+
+If upgrading from a release that used `C:\ProgramData\VeeamPgUpdate`, the script checks that
+former location for a trusted changes-in-progress marker. It returns
+`LEGACY_WORKROOT_RECOVERY_REQUIRED` (exit 40) rather than hiding an interrupted run. Follow
+the RMM instruction to run `-Recover -WorkRoot C:\ProgramData\VeeamPgUpdate`; after recovery,
+normal runs can use the new default.
 
 **Housekeeping runs every time**, audits included:
 
@@ -445,7 +450,8 @@ version after install/tuning, or `-Recover` diagnosed that emergency after the i
 boundary. In an update failure, Veeam services/schedules are deliberately left down or
 disabled. Diagnostic-only recovery does not change whatever state it found. Use the exact
 `Stage`, `UnhealthyServices`, `JobsLeftDisabled`, and `ActionRequired` fields before acting.
-Recovery evidence includes `runs\<timestamp>\backup\datadir\` and validated logical dumps;
+Recovery evidence includes `runs\<timestamp>\backup\datadir\`, its original DACL record in
+`datadir-acl.txt`, and validated logical dumps;
 restoration is always an operator-reviewed operation.
 
 A `CHANGES-IN-PROGRESS.marker` file in the work root blocks every normal audit/install;

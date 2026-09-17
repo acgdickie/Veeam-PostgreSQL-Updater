@@ -11,7 +11,10 @@ if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName',
-        'Get-DefaultConfig','Merge-Config','Protect-Folder','Test-TrustedOwner','Initialize-WorkRoot',
+        'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
+        'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
+        'Protect-Folder','New-ProtectedDirectory','Test-WorkRootSentinel','Get-TrustedLegacyRecoveryMarker',
+        'Get-ValidatedCompletedRunManifest','Initialize-WorkRoot',
         'Get-PolicyExitCode','Get-RmmActionForExitCode',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
@@ -45,8 +48,13 @@ function Throws {
 '--- Script-level policy surface ---'
 $scriptParameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
 Check 'TargetVersion parameter removed' ($scriptParameterNames -contains 'TargetVersion') 'False'
+Check 'ConfigPath parameter removed'    ($scriptParameterNames -contains 'ConfigPath')    'False'
 Check 'Install parameter remains'       ($scriptParameterNames -contains 'Install')       'True'
 Check 'Recover parameter exposed'       ($scriptParameterNames -contains 'Recover')       'True'
+$workRootParameter = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'WorkRoot' })[0]
+Check 'WorkRoot default is C:\temp\VeeamPgUpdate' $workRootParameter.DefaultValue.Value 'C:\temp\VeeamPgUpdate'
+$functionNames = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+Check 'Merge-Config function removed' ($functionNames -contains 'Merge-Config') 'False'
 
 $invokedCommands = @($ast.FindAll({
     param($node)
@@ -70,6 +78,13 @@ $forcedServiceStops = @($ast.FindAll({
 }, $true))
 Check 'never force-stops a Windows service' $forcedServiceStops.Count 0
 $scriptText = Get-Content -LiteralPath $script:Path -Raw
+Check 'script never discovers external config JSON' ($scriptText -match '(?i)(?:config\.json|VeeamPostgresUpdate\.config)') 'False'
+Check 'unsafe WorkRoot is rejected before log directory creation' ($scriptText.IndexOf("Complete-Run `$EXIT.PREFLIGHT 'WORKROOT_UNSAFE'") -lt $scriptText.IndexOf('New-Item -ItemType Directory -Path $script:LogDir')) 'True'
+Check 'result JSON requires a protected WorkRoot' ($scriptText -match 'if \(\$script:WorkRootProtected\) \{\s*try \{\s*Write-AtomicJson -Path \(Join-Path \$script:LogDir ''last-result\.json''\)') 'True'
+Check 'former WorkRoot marker cannot be bypassed' ($scriptText -match "LEGACY_WORKROOT_RECOVERY_REQUIRED") 'True'
+Check 'cold copy does not import source ACLs' ($scriptText -match "'/COPYALL'") 'False'
+Check 'cold copy captures original DACLs' ($scriptText -match "'datadir-acl\.txt'") 'True'
+Check 'cold copy uses data-only copy flags' ($scriptText -match "'/COPY:DAT'") 'True'
 Check 'strict no-force policy never invokes shutdown.exe' ($scriptText -match 'System32[\\/]shutdown\.exe') 'False'
 Check 'audit validates Veeam APIs before idempotent exit' ($scriptText.IndexOf("STEP 6B - Validate Veeam") -lt $scriptText.IndexOf("STEP 8 - Idempotency gate")) 'True'
 Check 'tuning SQL is prepared before Veeam services are disabled' ($scriptText.IndexOf("VEEAM_TUNING_PREP_FAILED") -lt $scriptText.IndexOf('$disableFailures = @(Disable-VeeamServiceStartup)')) 'True'
@@ -170,18 +185,7 @@ Check 'retentionDays 30'              $d.retentionDays      30
 Check 'no maintenanceWindow key'      (@($d.PSObject.Properties.Name) -contains 'maintenanceWindow')  'False'
 Check 'fresh object every call'       ([object]::ReferenceEquals((Get-DefaultConfig), (Get-DefaultConfig)))  'False'
 
-'--- Merge-Config: an override changes only its own keys ---'
-$m = Merge-Config (Get-DefaultConfig) ('{ "retentionDays": 60, "jobWaitTimeoutMinutes": 30, "_comment": "ignored" }' | ConvertFrom-Json)
-Check 'overridden key changes'        $m.retentionDays  60
-Check 'overridden wait changes'       $m.jobWaitTimeoutMinutes 30
-Check 'untouched key kept'            $m.installerTimeoutMinutes 120
-Check '_comment keys skipped'         (@($m.PSObject.Properties.Name) -contains '_comment')  'False'
-$legacyOverride = '{ "approvedTargets": ["17.12"], "supportedBranches": { "VBR99": ["99"] }, "branchFloors": { "17": "17.99" } }' | ConvertFrom-Json
-$m2 = Merge-Config (Get-DefaultConfig) $legacyOverride
-Check 'retired overrides ignored'     (@($m2.PSObject.Properties.Name | Where-Object { $_ -in @('approvedTargets','supportedBranches','branchFloors') }).Count)  0
-Check 'retired overrides change nothing' $m2.retentionDays  30
-Check 'null override = built-in'      (Merge-Config (Get-DefaultConfig) $null).retentionDays  30
-Check 'shipped example file parses'   ($null -ne (Get-Content (Join-Path (Split-Path $script:Path) 'VeeamPostgresUpdate.config.example.json') -Raw | ConvertFrom-Json))  'True'
+Check 'external config example removed' (Test-Path (Join-Path (Split-Path $script:Path) 'VeeamPostgresUpdate.config.example.json')) 'False'
 
 '--- RMM exit-code policy ---'
 Check 'healthy supported -> 0'              (Get-PolicyExitCode -Eol $false -UpdateAvailable $false -RebootRequired $false) 0
@@ -307,8 +311,9 @@ if ($isAdmin) {
     }
 
     '--- Initialize-WorkRoot: only ever take charge of our own folder ---'
-    $base = Join-Path $env:TEMP "vpgu-wr-test-$PID"
-    New-Item -ItemType Directory -Path $base -Force | Out-Null
+    $base = "C:\vpgu-wr-test-$PID"
+    if (Test-Path -LiteralPath $base) { throw "WorkRoot test parent already exists: $base" }
+    if (-not (New-ProtectedDirectory $base)) { throw "Could not atomically create WorkRoot test parent: $base" }
     try {
         # 1. Brand new folder -> ours, locked, sentinel dropped
         $new = Join-Path $base 'new'
@@ -316,13 +321,21 @@ if ($isAdmin) {
         Check 'new folder: ours'              $r.IsOurs     'True'
         Check 'new folder: locked'            $r.Protected  'True'
         Check 'new folder: sentinel written'  (Test-Path (Join-Path $new '.veeam-pg-updater'))  'True'
+        Check 'new folder: exact protected ACL' (Test-ProtectedFolderAcl $new) 'True'
+        Check 'new folder: trusted sentinel'  (Test-WorkRootSentinel $new) 'True'
+        Check 'new folder: no reparses'        (Test-PathTreeHasReparsePoint -Path $new -IncludeDescendants) 'False'
 
         # 2. Second run on the same folder -> still ours (sentinel)
         Add-Content -LiteralPath (Join-Path $new 'something.log') -Value 'x'
         Check 'rerun with contents: ours'     (Initialize-WorkRoot $new).IsOurs  'True'
 
-        # 3. Existing empty folder -> ours
+        # 3. Existing empty folders must already have the exact protected ACL.
+        $inheritedEmpty = Join-Path $base 'inherited-empty'; New-Item -ItemType Directory $inheritedEmpty | Out-Null
+        Check 'empty inherited folder: rejected' (Initialize-WorkRoot $inheritedEmpty).Protected 'False'
+        Check 'empty inherited folder: no sentinel' (Test-Path (Join-Path $inheritedEmpty '.veeam-pg-updater')) 'False'
+
         $empty = Join-Path $base 'empty'; New-Item -ItemType Directory $empty | Out-Null
+        Protect-Folder $empty | Out-Null
         Check 'empty existing: ours'          (Initialize-WorkRoot $empty).IsOurs  'True'
 
         # 4. THE DANGEROUS CASE: someone else's folder with files in it.
@@ -335,7 +348,83 @@ if ($isAdmin) {
         Check 'foreign folder: NOT locked'    $r.Protected  'False'
         Check 'foreign folder: ACL untouched' ((Get-Acl -LiteralPath $foreign).Sddl -eq $sddlBefore)  'True'
         Check 'foreign folder: no sentinel'   (Test-Path (Join-Path $foreign '.veeam-pg-updater'))  'False'
-        Check 'foreign folder: says why'      ($r.Reason -match 'not created by this script')  'True'
+        Check 'foreign folder: says why'      ($r.Reason -match 'lacks the protected ACL and trusted sentinel')  'True'
+
+        # A marker filename is not authority. Its content/type and the directory
+        # ACL must all be exactly what the script creates.
+        $forged = Join-Path $base 'forged'; New-Item -ItemType Directory $forged | Out-Null
+        Protect-Folder $forged | Out-Null
+        Set-Content -LiteralPath (Join-Path $forged '.veeam-pg-updater') -Value 'forged'
+        $forgedSddl = (Get-Acl -LiteralPath $forged).Sddl
+        $r = Initialize-WorkRoot $forged
+        Check 'forged sentinel: rejected'      $r.Protected 'False'
+        Check 'forged sentinel: ACL untouched' ((Get-Acl -LiteralPath $forged).Sddl -eq $forgedSddl) 'True'
+
+        $sentinelDir = Join-Path $base 'sentinel-directory'; New-Item -ItemType Directory $sentinelDir | Out-Null
+        Protect-Folder $sentinelDir | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $sentinelDir '.veeam-pg-updater') | Out-Null
+        Check 'directory sentinel: rejected'  (Initialize-WorkRoot $sentinelDir).Protected 'False'
+
+        $unsafeParent = Join-Path $base 'generic-all-parent'; New-Item -ItemType Directory $unsafeParent | Out-Null
+        $unsafeAcl = New-Object System.Security.AccessControl.DirectorySecurity
+        $unsafeAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;GA;;;WD)')
+        Set-Acl -LiteralPath $unsafeParent -AclObject $unsafeAcl
+        Check 'parent GenericAll is unsafe' (Test-SafeWorkRootParent $unsafeParent) 'False'
+
+        $stateAclFile = Join-Path $base 'state-acl-test.json'; Set-Content -LiteralPath $stateAclFile -Value '{}'
+        Check 'protected state file is trusted' (Test-RegularTrustedFile $stateAclFile) 'True'
+        $stateAcl = Get-Acl -LiteralPath $stateAclFile
+        $everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+        $stateAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($everyone, 'Write', 'Allow')))
+        Set-Acl -LiteralPath $stateAclFile -AclObject $stateAcl
+        Check 'writable state file is untrusted' (Test-RegularTrustedFile $stateAclFile) 'False'
+
+        $legacyFixture = Join-Path $base 'legacy-root'
+        Check 'legacy fixture initializes' (Initialize-WorkRoot $legacyFixture).Protected 'True'
+        $legacyFixtureMarker = Join-Path $legacyFixture 'CHANGES-IN-PROGRESS.marker'
+        Set-Content -LiteralPath $legacyFixtureMarker -Value '{"SchemaVersion":1}' -Encoding UTF8
+        Check 'trusted legacy marker is detected' (Get-TrustedLegacyRecoveryMarker -CurrentWorkRoot $new -LegacyWorkRoot $legacyFixture) $legacyFixtureMarker
+        Check 'current root is never legacy' ($null -eq (Get-TrustedLegacyRecoveryMarker -CurrentWorkRoot $legacyFixture -LegacyWorkRoot $legacyFixture)) 'True'
+
+        $completedRunId = '20260917-010203-004-2468'
+        $completedRun = Join-Path $base $completedRunId; New-Item -ItemType Directory $completedRun | Out-Null
+        $completedState = [ordered]@{ SchemaVersion=1; RunId=$completedRunId; RunDir=$completedRun; Stage='COMPLETE'; LogPath='' }
+        Write-AtomicJson -Path (Join-Path $completedRun 'recovery-state.json') -InputObject $completedState
+        Check 'completed manifest binds to exact run' ($null -ne (Get-ValidatedCompletedRunManifest $completedRun)) 'True'
+        $copiedRun = Join-Path $base '20260917-010203-004-2469'; New-Item -ItemType Directory $copiedRun | Out-Null
+        Write-AtomicJson -Path (Join-Path $copiedRun 'recovery-state.json') -InputObject $completedState
+        Check 'copied COMPLETE manifest is rejected' ($null -eq (Get-ValidatedCompletedRunManifest $copiedRun)) 'True'
+
+        # A previously managed root becomes unsafe if any child is a junction.
+        $junctionRoot = Join-Path $base 'junction-root'
+        Check 'junction fixture initializes' (Initialize-WorkRoot $junctionRoot).Protected 'True'
+        $junctionTarget = Join-Path $base 'junction-target'; New-Item -ItemType Directory $junctionTarget | Out-Null
+        $canary = Join-Path $junctionTarget 'outside-canary.txt'; Set-Content -LiteralPath $canary -Value 'untouched'
+        $junctionPath = Join-Path $junctionRoot 'logs'
+        $junctionCreated = $false
+        try {
+            New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget -ErrorAction Stop | Out-Null
+            $junctionCreated = $true
+            Check 'descendant junction: detected' (Test-PathTreeHasReparsePoint -Path $junctionRoot -IncludeDescendants) 'True'
+            Check 'descendant junction: WorkRoot rejected' (Initialize-WorkRoot $junctionRoot).Protected 'False'
+            Check 'descendant junction: target untouched' (Get-Content -LiteralPath $canary -Raw).Trim() 'untouched'
+        } catch {
+            '  SKIP  junction test could not create an NTFS junction'
+        } finally {
+            if ($junctionCreated -and (Test-Path -LiteralPath $junctionPath)) { [IO.Directory]::Delete($junctionPath) }
+        }
+
+        # Process-level check: an unsafe audit fails before creating logs/results.
+        $foreignHash = (Get-FileHash -LiteralPath (Join-Path $foreign 'their-data.txt') -Algorithm SHA256).Hash
+        $foreignSddl = (Get-Acl -LiteralPath $foreign).Sddl
+        $childOutput = (& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoLogo -NoProfile -File $script:Path -WorkRoot $foreign 2>&1 | Out-String)
+        $childExit = $LASTEXITCODE
+        Check 'unsafe root: exits 20'           $childExit 20
+        Check 'unsafe root: reports issue'      ($childOutput -match 'WORKROOT_UNSAFE') 'True'
+        Check 'unsafe root: no logs directory'  (Test-Path (Join-Path $foreign 'logs')) 'False'
+        Check 'unsafe root: no result JSON'     (Test-Path (Join-Path $foreign 'last-result.json')) 'False'
+        Check 'unsafe root: content untouched'  (Get-FileHash -LiteralPath (Join-Path $foreign 'their-data.txt') -Algorithm SHA256).Hash $foreignHash
+        Check 'unsafe root: ACL untouched'      ((Get-Acl -LiteralPath $foreign).Sddl -eq $foreignSddl) 'True'
 
         # 5. Drive root -> never ours. Reads only; C:\ always exists, so nothing is created.
         $r = Initialize-WorkRoot 'C:\'
@@ -911,19 +1000,22 @@ try {
 
 & {
     $WorkRoot = Join-Path $env:TEMP "vpgu-recover-diagnostic-$PID"
-    $runPath = [IO.Path]::GetFullPath((Join-Path $WorkRoot 'runs\post-install')).TrimEnd('\')
+    $runId = '20260917-010203-004-1234'
+    $runPath = [IO.Path]::GetFullPath((Join-Path $WorkRoot "runs\$runId")).TrimEnd('\')
+    New-Item -ItemType Directory -Path $WorkRoot -Force | Out-Null
+    Protect-Folder $WorkRoot | Out-Null
     New-Item -ItemType Directory -Path $runPath -Force | Out-Null
     try {
         $statePath = Join-Path $runPath 'recovery-state.json'
         $markerPath = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
         $state = [ordered]@{
-            SchemaVersion=1; RunDir=$runPath; Stage='INSTALLING'; InstallerStarted=$true
+            SchemaVersion=1; RunId=$runId; RunDir=$runPath; Stage='INSTALLING'; InstallerStarted=$true
             Products='VBR'; OriginalVersion='15.2'; TargetVersion='15.19'
             PgServiceName=''; PsqlPath=''; PgPort=''
         }
         Write-AtomicJson -Path $statePath -InputObject $state
         Write-AtomicJson -Path $markerPath -InputObject ([ordered]@{
-            SchemaVersion=1; RunDir=$runPath; StateFile=$statePath; Stage='INSTALLING'; InstallerStarted=$true
+            SchemaVersion=1; RunId=$runId; RunDir=$runPath; StateFile=$statePath; Stage='INSTALLING'; InstallerStarted=$true
         })
 
         $EXIT = @{ ESCALATE=40; ESCALATE_NOW=50 }
@@ -946,6 +1038,14 @@ try {
         Check 'post-installer recovery performs no mutation' $script:RecoveryMutationCount 0
         Check 'post-installer marker remains' (Test-Path -LiteralPath $markerPath) 'True'
         Check 'post-installer RMM issue is explicit' $script:Report.IssueCode 'POST_INSTALL_RECOVERY_REQUIRES_OPERATOR'
+
+        $state.RunId = '20260917-010203-004-9999'
+        Write-AtomicJson -Path $statePath -InputObject $state
+        $script:RecoveryCapture = $null
+        try { Invoke-ExplicitRecovery -MarkerPath $markerPath -Cfg (Get-DefaultConfig) }
+        catch { if ($_.Exception.Message -ne 'COMPLETE-RUN-TEST-SENTINEL') { throw } }
+        Check 'recovery rejects marker/state RunId mismatch' $script:RecoveryCapture.Outcome 'INVALID_RECOVERY_STATE'
+        Check 'RunId mismatch performs no mutation' $script:RecoveryMutationCount 0
     } finally {
         Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -954,11 +1054,12 @@ try {
 & {
     $WorkRoot = Join-Path $env:TEMP "vpgu-recover-traversal-$PID"
     New-Item -ItemType Directory -Path $WorkRoot -Force | Out-Null
+    Protect-Folder $WorkRoot | Out-Null
     try {
         $outside = Join-Path $env:TEMP "vpgu-outside-$PID\recovery-state.json"
         $markerPath = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
         Write-AtomicJson -Path $markerPath -InputObject ([ordered]@{
-            SchemaVersion=1; RunDir=(Split-Path -Parent $outside); StateFile=$outside; Stage='JOBS_DISABLED'; InstallerStarted=$false
+            SchemaVersion=1; RunId='20260917-010203-004-1234'; RunDir=(Split-Path -Parent $outside); StateFile=$outside; Stage='JOBS_DISABLED'; InstallerStarted=$false
         })
         $EXIT = @{ ESCALATE=40; ESCALATE_NOW=50 }
         $script:RecoveryCapture = $null
@@ -974,6 +1075,59 @@ try {
     } finally {
         Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $env:TEMP "vpgu-outside-$PID") -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+& {
+    $WorkRoot = Join-Path $env:TEMP "vpgu-recover-junction-$PID"
+    $outsideRoot = Join-Path $env:TEMP "vpgu-recover-junction-target-$PID"
+    $runId = '20260917-010203-004-4321'
+    $runsJunction = Join-Path $WorkRoot 'runs'
+    $junctionCreated = $false
+    New-Item -ItemType Directory -Path $WorkRoot -Force | Out-Null
+    Protect-Folder $WorkRoot | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $outsideRoot $runId) -Force | Out-Null
+    try {
+        try {
+            New-Item -ItemType Junction -Path $runsJunction -Target $outsideRoot -ErrorAction Stop | Out-Null
+            $junctionCreated = $true
+        } catch {
+            '  SKIP  recovery junction test could not create an NTFS junction'
+        }
+        if ($junctionCreated) {
+            $runPath = [IO.Path]::GetFullPath((Join-Path $runsJunction $runId)).TrimEnd('\')
+            $statePath = Join-Path $runPath 'recovery-state.json'
+            $markerPath = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
+            $canary = Join-Path $outsideRoot 'outside-canary.txt'
+            Set-Content -LiteralPath $canary -Value 'untouched'
+            Write-AtomicJson -Path $statePath -InputObject ([ordered]@{
+                SchemaVersion=1; RunId=$runId; RunDir=$runPath; Stage='JOBS_DISABLED'; InstallerStarted=$false
+            })
+            Write-AtomicJson -Path $markerPath -InputObject ([ordered]@{
+                SchemaVersion=1; RunId=$runId; RunDir=$runPath; StateFile=$statePath; Stage='JOBS_DISABLED'; InstallerStarted=$false
+            })
+            $EXIT = @{ ESCALATE=40; ESCALATE_NOW=50 }
+            $script:RecoveryCapture = $null
+            $script:RecoveryMutationCount = 0
+            function Test-TrustedOwner { param($Path) return $true }
+            function Start-Service { $script:RecoveryMutationCount++ }
+            function Stop-Service  { $script:RecoveryMutationCount++ }
+            function Enable-VeeamJobById { $script:RecoveryMutationCount++ }
+            function Complete-Run {
+                param([int]$Code,[string]$Outcome,[string]$Detail)
+                $script:RecoveryCapture = [pscustomobject]@{ Code=$Code; Outcome=$Outcome; Detail=$Detail }
+                throw 'COMPLETE-RUN-TEST-SENTINEL'
+            }
+            try { Invoke-ExplicitRecovery -MarkerPath $markerPath -Cfg (Get-DefaultConfig) }
+            catch { if ($_.Exception.Message -ne 'COMPLETE-RUN-TEST-SENTINEL') { throw } }
+            Check 'recovery rejects junction escape' $script:RecoveryCapture.Outcome 'INVALID_RECOVERY_PATH'
+            Check 'junction recovery performs no mutation' $script:RecoveryMutationCount 0
+            Check 'junction recovery leaves outside target' (Get-Content -LiteralPath $canary -Raw).Trim() 'untouched'
+        }
+    } finally {
+        if ($junctionCreated -and (Test-Path -LiteralPath $runsJunction)) { [IO.Directory]::Delete($runsJunction) }
+        Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

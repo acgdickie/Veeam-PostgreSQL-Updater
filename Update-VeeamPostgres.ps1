@@ -43,16 +43,10 @@
     manifest. If the installer may have started, recovery is diagnostic-only and
     exits 40 or 50 for an operator; it never rolls database files back automatically.
 
-.PARAMETER ConfigPath
-    OPTIONAL. A JSON file whose keys override the built-in settings (see
-    Get-DefaultConfig below). You normally never need this - the script carries its
-    own settings so an RMM only has to upload this one file.
-    Without it the script looks for an override in <WorkRoot>\config.json, then
-    next to the script as VeeamPostgresUpdate.config.json, then uses built-ins.
-
 .PARAMETER WorkRoot
-    Local folder for logs, dumps and the cold copy. Default C:\ProgramData\VeeamPgUpdate
-    Logs are ALWAYS written here, and pruned after retentionDays.
+    Local folder for logs, dumps and the cold copy. Default C:\temp\VeeamPgUpdate
+    The folder and its parent must pass ownership, ACL and reparse-point checks.
+    Logs are written here only after those checks pass, and pruned after retentionDays.
 
 .PARAMETER SkipDownloadInAudit
     Audit mode normally checks the EnterpriseDB download page for the exact
@@ -91,8 +85,7 @@ param(
     [switch] $Install,
     [switch] $Reboot,
     [switch] $Recover,
-    [string] $ConfigPath,
-    [string] $WorkRoot = 'C:\ProgramData\VeeamPgUpdate',
+    [string] $WorkRoot = 'C:\temp\VeeamPgUpdate',
     [switch] $SkipDownloadInAudit
 )
 
@@ -135,8 +128,8 @@ $EXIT = @{
 #      How long to keep completed logs and recovery sets (dumps + cold copy).
 #      Unresolved runs and the two newest completed recovery sets are retained.
 #
-#  To override any of these on ONE server without editing the script, drop a JSON
-#  file with just the keys you want to change at <WorkRoot>\config.json.
+#  These are the only adjustable settings. External settings/override files are
+#  deliberately not supported; edit this block and redeploy the reviewed script.
 # ===========================================================================
 function Get-DefaultConfig {
     $json = @'
@@ -149,17 +142,29 @@ function Get-DefaultConfig {
     return ($json | ConvertFrom-Json)
 }
 
-# Overlay an override object onto the built-in settings. Each recognized top-level
-# key REPLACES the built-in value wholesale. Unknown keys and keys starting with _
-# are ignored.
-function Merge-Config {
-    param([Parameter(Mandatory)] $Base, $Override)
-    if (-not $Override) { return $Base }
-    foreach ($p in @($Override.PSObject.Properties)) {
-        if ($p.Name -like '_*') { continue }
-        if (@($Base.PSObject.Properties.Name) -contains $p.Name) { $Base.($p.Name) = $p.Value }
+# Normalize the operator-supplied path before deriving any child paths. WorkRoot
+# contains executable installers and database recovery material, so ambiguous,
+# relative, UNC and drive-root paths fail before the script writes anything.
+try {
+    if ([string]::IsNullOrWhiteSpace($WorkRoot) -or
+        -not [IO.Path]::IsPathRooted($WorkRoot) -or
+        $WorkRoot -notmatch '^[A-Za-z]:[\\/]') {
+        throw 'WorkRoot must be an absolute path on a local drive.'
     }
-    return $Base
+    $normalizedWorkRoot = [IO.Path]::GetFullPath($WorkRoot)
+    $normalizedRoot = [IO.Path]::GetPathRoot($normalizedWorkRoot)
+    if ($normalizedWorkRoot.TrimEnd('\') -ieq $normalizedRoot.TrimEnd('\')) {
+        throw 'WorkRoot cannot be the root of a drive.'
+    }
+    $WorkRoot = $normalizedWorkRoot.TrimEnd('\')
+} catch {
+    $earlyMode = if ($Recover) { 'RECOVER' } elseif ($Install) { 'INSTALL' } else { 'AUDIT' }
+    $earlyDetail = "WorkRoot '$WorkRoot' is unsafe: $($_.Exception.Message)"
+    Write-Host '=== RMM SUMMARY ===' -ForegroundColor Magenta
+    Write-Host "Computer=$env:COMPUTERNAME; Timestamp=$((Get-Date).ToString('s')); Mode=$earlyMode; Stage=UNTOUCHED; Outcome=WORKROOT_UNSAFE; ExitCode=$($EXIT.PREFLIGHT); IssueCode=WORKROOT_UNSAFE; ActionRequired=Use an absolute non-root path on a local drive.; Detail=$earlyDetail"
+    Write-Host "RMM ISSUE: WORKROOT_UNSAFE | $earlyDetail" -ForegroundColor Yellow
+    Write-Host '==================='
+    exit $EXIT.PREFLIGHT
 }
 
 # ---------------------------------------------------------------------------
@@ -180,6 +185,8 @@ $script:Transcript   = $null
 $script:Mutex        = $null
 $script:MutexHeld    = $false
 $script:Exiting      = $false
+$script:WorkRootIsOurs = $false
+$script:WorkRootProtected = $false
 $script:DisabledJobs = @()
 $script:ManagedJobInventory = @()
 $script:VeeamServices = @()
@@ -809,12 +816,14 @@ function Complete-Run {
     }
     Write-Host '==================='
 
-    try {
-        Write-AtomicJson -Path (Join-Path $script:LogDir 'last-result.json') -InputObject $script:Report
-        if (Test-Path -LiteralPath $script:RunDir) {
-            Write-AtomicJson -Path (Join-Path $script:RunDir 'result.json') -InputObject $script:Report
-        }
-    } catch { Write-Log "Could not write last-result.json: $($_.Exception.Message)" WARN }
+    if ($script:WorkRootProtected) {
+        try {
+            Write-AtomicJson -Path (Join-Path $script:LogDir 'last-result.json') -InputObject $script:Report
+            if (Test-Path -LiteralPath $script:RunDir) {
+                Write-AtomicJson -Path (Join-Path $script:RunDir 'result.json') -InputObject $script:Report
+            }
+        } catch { Write-Log "Could not write last-result.json: $($_.Exception.Message)" WARN }
+    }
 
     if ($script:Mutex -and $script:MutexHeld) {
         try { $script:Mutex.ReleaseMutex() } catch {}
@@ -835,16 +844,186 @@ trap {
 }
 
 # ---------------------------------------------------------------------------
-# Lock a folder to SYSTEM + Administrators only, replacing its whole DACL.
+# WorkRoot trust boundary
 #
-# The work root holds privileged database dumps and a cold copy of the whole
-# database. Restoring a dump runs code chosen by whoever wrote it, so ordinary
-# users must not be able to read or change them. Well-known SIDs are used rather
-# than names so this also works on non-English Windows ("VORDEFINIERT\Administratoren").
+# The work root holds a downloaded installer, privileged database dumps and a
+# cold copy. A marker filename alone is not proof that the folder is ours: an
+# ordinary user could plant that marker and junctions below a writable C:\temp.
+# These helpers fail closed on reparse points and verify the exact ACL we set.
+# Well-known SIDs keep the checks language-neutral.
 # ---------------------------------------------------------------------------
+function Get-WorkRootSentinelText {
+    return 'Created by Update-VeeamPostgres.ps1. Marks this folder as safe for the script to lock down and clean up.'
+}
+
+# Recovery artifacts are trusted only when owned by SYSTEM or Administrators.
+function Test-TrustedOwner {
+    param([string] $Path)
+    try {
+        $owner = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        return ($owner -eq 'S-1-5-18' -or $owner -eq 'S-1-5-32-544')
+    } catch { return $false }
+}
+
+function Test-PathTreeHasReparsePoint {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [switch] $IncludeDescendants
+    )
+    try {
+        $full = [IO.Path]::GetFullPath($Path)
+        $pathRoot = [IO.Path]::GetPathRoot($full)
+        $current = $pathRoot
+        $relative = $full.Substring($pathRoot.Length)
+        foreach ($part in @($relative -split '[\\/]' | Where-Object { $_ })) {
+            $current = Join-Path $current $part
+            try { $attributes = [IO.File]::GetAttributes($current) }
+            catch [IO.FileNotFoundException] { break }
+            catch [IO.DirectoryNotFoundException] { break }
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        }
+
+        if ($IncludeDescendants -and (Test-Path -LiteralPath $full -PathType Container)) {
+            $pending = New-Object 'System.Collections.Generic.Queue[string]'
+            $pending.Enqueue($full)
+            while ($pending.Count -gt 0) {
+                $directory = $pending.Dequeue()
+                foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+                    if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+                    if ($child.PSIsContainer) { $pending.Enqueue($child.FullName) }
+                }
+            }
+        }
+        return $false
+    } catch {
+        # An ACL or path we cannot inspect is not a safe place for privileged data.
+        return $true
+    }
+}
+
+function Test-DirectoryHasReparseChild {
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        }
+        return $false
+    } catch { return $true }
+}
+
+function Test-RegularTrustedFile {
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
+        if (-not (Test-TrustedOwner $Path)) { return $false }
+        $trustedSids = @('S-1-5-18','S-1-5-32-544')
+        $dangerous = [int64]([System.Security.AccessControl.FileSystemRights]::Write -bor
+                             [System.Security.AccessControl.FileSystemRights]::Delete -bor
+                             [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                             [System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                     [int64]0x10000000 -bor [int64]0x40000000
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+            if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                $trustedSids -notcontains $rule.IdentityReference.Value -and
+                ([int64]$rule.FileSystemRights -band $dangerous) -ne 0) {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Test-ProtectedFolderAcl {
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) { return $false }
+        if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') { return $false }
+
+        $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        if ($rules.Count -ne 2) { return $false }
+        $requiredInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                               [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+            $matching = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
+            if ($matching.Count -ne 1) { return $false }
+            $rule = $matching[0]
+            if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+                $rule.IsInherited -or
+                [int]$rule.FileSystemRights -ne [int][System.Security.AccessControl.FileSystemRights]::FullControl -or
+                [int]$rule.InheritanceFlags -ne [int]$requiredInheritance -or
+                $rule.PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# The parent must not let a non-privileged principal delete/replace children or
+# rewrite the parent's ACL. Create-directory permission alone is tolerated: new
+# folders use an unpredictable protected staging name and an atomic rename.
+function Test-SafeWorkRootParent {
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        if (Test-PathTreeHasReparsePoint -Path $Path) { return $false }
+        $trustedSids = @(
+            'S-1-5-18',       # SYSTEM
+            'S-1-5-32-544',   # Administrators
+            'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # TrustedInstaller
+        )
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentPrincipal = New-Object System.Security.Principal.WindowsPrincipal($currentIdentity)
+        if ($currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            $trustedSids += $currentIdentity.User.Value
+        }
+        $dangerous = [int64]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+                             [System.Security.AccessControl.FileSystemRights]::Delete -bor
+                             [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                             [System.Security.AccessControl.FileSystemRights]::TakeOwnership) -bor
+                     [int64]0x10000000 -bor # GENERIC_ALL
+                     [int64]0x40000000      # GENERIC_WRITE
+
+        # Validate every existing namespace component, not just the immediate
+        # parent. Otherwise a protected parent can still be swapped by someone
+        # who can delete it through its own parent.
+        $resolvedPath = [IO.Path]::GetFullPath($Path)
+        $pathRoot = [IO.Path]::GetPathRoot($resolvedPath)
+        $full = if ($resolvedPath.TrimEnd('\') -ieq $pathRoot.TrimEnd('\')) { $pathRoot } else { $resolvedPath.TrimEnd('\') }
+        $components = @($pathRoot)
+        $current = $pathRoot
+        $relative = $full.Substring($pathRoot.Length)
+        foreach ($part in @($relative -split '[\\/]' | Where-Object { $_ })) {
+            $current = Join-Path $current $part
+            $components += $current
+        }
+        foreach ($component in $components) {
+            $item = Get-Item -LiteralPath $component -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
+            $acl = Get-Acl -LiteralPath $component -ErrorAction Stop
+            if ($trustedSids -notcontains $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value) { return $false }
+            foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+                if ($trustedSids -contains $rule.IdentityReference.Value) { continue }
+                if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+                if (([int64]$rule.FileSystemRights -band $dangerous) -ne 0) { return $false }
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# Lock a folder to SYSTEM + Administrators only, replacing its whole DACL, then
+# read it back. Set-Acl can report success even when a provider did not produce
+# the intended descriptor, so callers rely on the verification result.
 function Protect-Folder {
     param([Parameter(Mandatory)][string] $Path)
     try {
+        if (Test-PathTreeHasReparsePoint -Path $Path) { return $false }
         $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
         $admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
         $acl = New-Object System.Security.AccessControl.DirectorySecurity
@@ -854,61 +1033,198 @@ function Protect-Folder {
                 $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
         }
         $acl.SetOwner($admins)
-        # Set-Acl, not DirectoryInfo.SetAccessControl(): in PowerShell 7 that is an
-        # extension method PowerShell cannot call, and it fails silently here.
         Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
-        return $true
+        return (Test-ProtectedFolderAcl $Path)
+    } catch { return $false }
+}
+
+function New-ProtectedDirectory {
+    param([Parameter(Mandatory)][string] $Path)
+    $stage = $null
+    try {
+        $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $parent = [IO.Directory]::GetParent($full).FullName
+        if (-not (Test-SafeWorkRootParent $parent) -or (Test-Path -LiteralPath $full)) { return $false }
+        $stage = Join-Path $parent ('.veeam-pg-stage-' + [guid]::NewGuid().ToString('N'))
+        $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $stageAcl = New-Object System.Security.AccessControl.DirectorySecurity
+        $stageAcl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @($system, $admins)) {
+            $stageAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        }
+        $stageAcl.SetOwner($admins)
+
+        # Create with the final DACL in the same native operation. Creating first
+        # and calling Set-Acl later leaves a writable C:\ staging directory open
+        # to a junction-swap race on standard Windows ACLs.
+        $stageInfo = New-Object System.IO.DirectoryInfo($stage)
+        if ($PSVersionTable.PSEdition -eq 'Core') {
+            [System.IO.FileSystemAclExtensions]::Create($stageInfo, $stageAcl)
+        } else {
+            $stageInfo.Create($stageAcl)
+        }
+        if (-not (Test-ProtectedFolderAcl $stage)) { return $false }
+        if (Test-PathTreeHasReparsePoint -Path $stage -IncludeDescendants) { return $false }
+        if (@(Get-ChildItem -LiteralPath $stage -Force -ErrorAction Stop).Count -ne 0) { return $false }
+        [IO.Directory]::Move($stage, $full)
+        $stage = $null
+        return ((Test-ProtectedFolderAcl $full) -and -not (Test-PathTreeHasReparsePoint -Path $full -IncludeDescendants))
     } catch {
         return $false
+    } finally {
+        if ($stage -and (Test-Path -LiteralPath $stage) -and
+            (Test-ProtectedFolderAcl $stage) -and
+            -not (Test-PathTreeHasReparsePoint -Path $stage -IncludeDescendants)) {
+            try { [IO.Directory]::Delete($stage, $true) } catch {}
+        }
     }
 }
 
-# ---------------------------------------------------------------------------
-# Decide whether the work root is ours to lock down and clean up.
-#
-# -WorkRoot is user-supplied. Replacing the permissions of, or purging old folders
-# inside, someone else's folder - or a whole drive - would be destructive. So the
-# script only takes charge of a folder it created (it leaves a sentinel file), or
-# one that is empty. Anything else is used for logs only, and -Install refuses.
-# ---------------------------------------------------------------------------
-function Initialize-WorkRoot {
+function Test-WorkRootSentinel {
     param([Parameter(Mandatory)][string] $Path)
     $sentinel = Join-Path $Path '.veeam-pg-updater'
-    $full     = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $root     = [System.IO.Path]::GetPathRoot($full).TrimEnd('\')
+    if (-not (Test-RegularTrustedFile $sentinel)) { return $false }
+    try {
+        $content = (Get-Content -LiteralPath $sentinel -Raw -ErrorAction Stop).TrimEnd([char[]]"`r`n")
+        return ($content -ceq (Get-WorkRootSentinelText))
+    } catch { return $false }
+}
 
+function Get-TrustedLegacyRecoveryMarker {
+    param(
+        [Parameter(Mandatory)][string] $CurrentWorkRoot,
+        [string] $LegacyWorkRoot = 'C:\ProgramData\VeeamPgUpdate'
+    )
+    try {
+        $current = [IO.Path]::GetFullPath($CurrentWorkRoot).TrimEnd('\')
+        $legacy = [IO.Path]::GetFullPath($LegacyWorkRoot).TrimEnd('\')
+        if ($current -ieq $legacy) { return $null }
+        $marker = Join-Path $legacy 'CHANGES-IN-PROGRESS.marker'
+        if ((Test-PathTreeHasReparsePoint -Path $marker) -or -not (Test-RegularTrustedFile $marker)) { return $null }
+        return $marker
+    } catch { return $null }
+}
+
+function Get-ValidatedCompletedRunManifest {
+    param([Parameter(Mandatory)][string] $RunDirectory)
+    try {
+        $fullRun = [IO.Path]::GetFullPath($RunDirectory).TrimEnd('\')
+        $runId = [IO.Path]::GetFileName($fullRun)
+        if ($runId -notmatch '^\d{8}-\d{6}-\d{3}-\d+$') { return $null }
+        $statePath = Join-Path $fullRun 'recovery-state.json'
+        if (-not (Test-RegularTrustedFile $statePath)) { return $null }
+        $manifest = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($required in @('SchemaVersion','RunId','RunDir','Stage')) {
+            if ($manifest.PSObject.Properties.Name -notcontains $required) { return $null }
+        }
+        $boundRun = [IO.Path]::GetFullPath("$($manifest.RunDir)").TrimEnd('\')
+        if ([int]$manifest.SchemaVersion -ne 1 -or
+            "$($manifest.Stage)" -cne 'COMPLETE' -or
+            "$($manifest.RunId)" -cne $runId -or
+            $boundRun -ine $fullRun) {
+            return $null
+        }
+        return $manifest
+    } catch { return $null }
+}
+
+function Initialize-WorkRoot {
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $root = [IO.Path]::GetPathRoot($full).TrimEnd('\')
+    } catch {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$Path; Reason="invalid WorkRoot path: $($_.Exception.Message)" }
+    }
     if ($full -eq $root) {
-        if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
-        return [pscustomobject]@{ IsOurs = $false; Protected = $false; Reason = "$Path is the root of a drive or share" }
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="$Path is the root of a drive or share" }
+    }
+    if (Test-PathTreeHasReparsePoint -Path $full) {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="$full or one of its ancestors is a reparse point" }
     }
 
-    $isOurs = $false
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-        $isOurs = $true
-    } elseif (Test-Path -LiteralPath $sentinel) {
-        $isOurs = $true
-    } elseif (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-        $isOurs = $true
+    $parent = [IO.Directory]::GetParent($full).FullName
+    if (-not (Test-Path -LiteralPath $parent)) {
+        # The documented default remains self-starting. No other missing parent is
+        # created because taking over an arbitrary parent would be destructive.
+        if ($full -ine 'C:\temp\VeeamPgUpdate' -or $parent -ine 'C:\temp') {
+            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="parent directory does not exist: $parent" }
+        }
+        $grandParent = [IO.Directory]::GetParent($parent).FullName
+        if (-not (Test-SafeWorkRootParent $grandParent) -or -not (New-ProtectedDirectory $parent)) {
+            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="could not create a protected default parent: $parent" }
+        }
     }
-    if (-not $isOurs) {
-        return [pscustomobject]@{ IsOurs = $false; Protected = $false; Reason = "$Path already existed with other files in it and was not created by this script" }
+    if (-not (Test-SafeWorkRootParent $parent)) {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="parent directory is replaceable or not trusted: $parent" }
     }
 
-    $protected = Protect-Folder $Path
-    if ($protected -and -not (Test-Path -LiteralPath $sentinel)) {
-        try { Set-Content -LiteralPath $sentinel -Value 'Created by Update-VeeamPostgres.ps1. Marks this folder as safe for the script to lock down and clean up.' -Encoding UTF8 } catch {}
+    if (-not (Test-Path -LiteralPath $full)) {
+        if (-not (New-ProtectedDirectory $full)) {
+            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="could not create a protected WorkRoot at $full" }
+        }
     }
-    $reason = if ($protected) { '' } else { "could not set permissions on $Path" }
-    return [pscustomobject]@{ IsOurs = $true; Protected = $protected; Reason = $reason }
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer) {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="$full is not a directory" }
+    }
+    if (Test-DirectoryHasReparseChild -Path $full) {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="$full contains a reparse point" }
+    }
+
+    try { $children = @(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop) }
+    catch {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="could not enumerate $full safely: $($_.Exception.Message)" }
+    }
+    if ($children.Count -eq 0) {
+        if (-not (Test-ProtectedFolderAcl $full)) {
+            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="$full is empty but does not already have the protected SYSTEM/Administrators ACL" }
+        }
+        $sentinel = Join-Path $full '.veeam-pg-updater'
+        try {
+            Set-Content -LiteralPath $sentinel -Value (Get-WorkRootSentinelText) -Encoding UTF8 -NoNewline -ErrorAction Stop
+            if (-not (Test-TrustedOwner $sentinel)) {
+                $sentinelAcl = Get-Acl -LiteralPath $sentinel -ErrorAction Stop
+                $sentinelAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+                Set-Acl -LiteralPath $sentinel -AclObject $sentinelAcl -ErrorAction Stop
+            }
+        } catch {
+            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="could not write the trusted WorkRoot sentinel: $($_.Exception.Message)" }
+        }
+    } elseif (-not (Test-ProtectedFolderAcl $full) -or -not (Test-WorkRootSentinel $full)) {
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="$full is non-empty but lacks the protected ACL and trusted sentinel created by this script" }
+    }
+
+    $protected = (Test-ProtectedFolderAcl $full) -and
+                 (Test-WorkRootSentinel $full) -and
+                 -not (Test-DirectoryHasReparseChild -Path $full)
+    $reason = if ($protected) { '' } else { "WorkRoot trust verification failed after initialization: $full" }
+    return [pscustomobject]@{ IsOurs=$protected; Protected=$protected; Path=$full; Reason=$reason }
 }
 
 # ---------------------------------------------------------------------------
 # Start harness
 # ---------------------------------------------------------------------------
+# Changing the default must not hide an interrupted run from an older deployment.
+# A trusted marker under the former default is handled only from that original
+# WorkRoot so all recorded paths stay bound to the evidence that created them.
+$legacyWorkRoot = 'C:\ProgramData\VeeamPgUpdate'
+$legacyMarker = Get-TrustedLegacyRecoveryMarker -CurrentWorkRoot $WorkRoot -LegacyWorkRoot $legacyWorkRoot
+if ($legacyMarker) {
+    $script:Report.IssueCode = 'LEGACY_WORKROOT_RECOVERY_REQUIRED'
+    $script:Report.ActionRequired = "PAGE AN OPERATOR. Run this script with -Recover -WorkRoot '$legacyWorkRoot' before using the new default."
+    Complete-Run $EXIT.ESCALATE 'LEGACY_WORKROOT_RECOVERY_REQUIRED' "A trusted changes-in-progress marker exists at the former default: $legacyMarker. The new WorkRoot was not used for maintenance."
+}
+
 $wrInit = Initialize-WorkRoot $WorkRoot
 $script:WorkRootIsOurs    = $wrInit.IsOurs
 $script:WorkRootProtected = $wrInit.Protected
+if (-not $script:WorkRootProtected) {
+    Write-Log "Work root rejected before logging: $($wrInit.Reason)" ERROR
+    Complete-Run $EXIT.PREFLIGHT 'WORKROOT_UNSAFE' "The work root failed its ownership, ACL or reparse-point checks ($($wrInit.Reason)). No log or result file was written there."
+}
 if (-not (Test-Path -LiteralPath $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
 # NOTE: the per-run folder under runs\ is only created by -Install, when there is
 # something to put in it. Audit runs leave nothing behind but their log.
@@ -920,9 +1236,6 @@ Write-Log "Veeam PostgreSQL Updater - mode $($script:Report.Mode)" STEP
 Write-Log "PowerShell: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
 Write-Log "Work root : $WorkRoot"
 Write-Log "Transcript: $($script:Transcript)"
-if (-not $script:WorkRootProtected) {
-    Write-Log "Work root not locked down: $($wrInit.Reason). Its permissions and contents are left alone. Audit can continue; -Install will refuse." WARN
-}
 
 # Single-instance lock. An abandoned mutex (previous run killed mid-flight) throws
 # AbandonedMutexException and still grants ownership - that is not a reason to abort.
@@ -1773,9 +2086,9 @@ function Wait-VeeamIdle {
 function Invoke-ExplicitRecovery {
     param([Parameter(Mandatory)][string] $MarkerPath, [Parameter(Mandatory)] $Cfg)
 
-    if (-not (Test-TrustedOwner $MarkerPath)) {
+    if ((Test-PathTreeHasReparsePoint -Path $MarkerPath) -or -not (Test-RegularTrustedFile $MarkerPath)) {
         $script:Stage = 'INSTALLING'
-        Complete-Run $EXIT.ESCALATE 'UNTRUSTED_RECOVERY_MARKER' 'The recovery marker is not owned by SYSTEM or Administrators. No automatic action was taken.'
+        Complete-Run $EXIT.ESCALATE 'UNTRUSTED_RECOVERY_MARKER' 'The recovery marker is missing, untrusted, or resolves through a reparse point. No automatic action was taken.'
     }
     $marker = $null
     try { $marker = Get-Content -LiteralPath $MarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
@@ -1783,14 +2096,15 @@ function Invoke-ExplicitRecovery {
         $script:Stage = 'INSTALLING'
         Complete-Run $EXIT.ESCALATE 'LEGACY_OR_INVALID_MARKER' "The marker is not a versioned recovery pointer. No automatic action was taken. Inspect it and recover manually: $($_.Exception.Message)"
     }
-    foreach ($required in @('SchemaVersion','RunDir','StateFile','InstallerStarted','Stage')) {
+    foreach ($required in @('SchemaVersion','RunId','RunDir','StateFile','InstallerStarted','Stage')) {
         if ($marker.PSObject.Properties.Name -notcontains $required) {
             $script:Stage = 'INSTALLING'
             Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_MARKER' "Recovery marker is missing '$required'. No automatic action was taken."
         }
     }
 
-    $runsRoot = [IO.Path]::GetFullPath((Join-Path $WorkRoot 'runs')).TrimEnd('\') + '\'
+    $runsRootPath = [IO.Path]::GetFullPath((Join-Path $WorkRoot 'runs')).TrimEnd('\')
+    $runsRoot = $runsRootPath + '\'
     try {
         $statePath = [IO.Path]::GetFullPath("$($marker.StateFile)")
         $runPath = [IO.Path]::GetFullPath("$($marker.RunDir)").TrimEnd('\')
@@ -1798,24 +2112,44 @@ function Invoke-ExplicitRecovery {
         $script:Stage = 'INSTALLING'
         Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_PATH' "Recovery path is invalid: $($_.Exception.Message)"
     }
+    $runParent = try { [IO.Directory]::GetParent($runPath).FullName.TrimEnd('\') } catch { '' }
+    $runLeaf = [IO.Path]::GetFileName($runPath)
     if (-not $statePath.StartsWith($runsRoot, [StringComparison]::OrdinalIgnoreCase) -or
         -not (($runPath + '\').StartsWith($runsRoot, [StringComparison]::OrdinalIgnoreCase)) -or
-        $statePath -ine (Join-Path $runPath 'recovery-state.json')) {
+        $runParent -ine $runsRootPath -or
+        $runLeaf -notmatch '^\d{8}-\d{6}-\d{3}-\d+$' -or
+        "$($marker.RunId)" -cne $runLeaf -or
+        $statePath -ine (Join-Path $runPath 'recovery-state.json') -or
+        (Test-PathTreeHasReparsePoint -Path $runsRootPath) -or
+        (Test-PathTreeHasReparsePoint -Path $statePath)) {
         $script:Stage = 'INSTALLING'
-        Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_PATH' 'Recovery paths do not resolve inside this WorkRoot\runs directory.'
+        Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_PATH' 'Recovery paths must be non-reparse direct children of this WorkRoot\runs directory and match the recorded run ID.'
     }
-    if (-not (Test-Path -LiteralPath $statePath) -or -not (Test-TrustedOwner $statePath)) {
+    if (-not (Test-Path -LiteralPath $runPath -PathType Container) -or
+        -not (Test-TrustedOwner $runPath) -or
+        -not (Test-RegularTrustedFile $statePath)) {
         $script:Stage = 'INSTALLING'
-        Complete-Run $EXIT.ESCALATE 'UNTRUSTED_RECOVERY_STATE' "Recovery state is missing or is not owned by SYSTEM/Administrators: $statePath"
+        Complete-Run $EXIT.ESCALATE 'UNTRUSTED_RECOVERY_STATE' "Recovery directory/state is missing, reparse-backed, or not owned by SYSTEM/Administrators: $statePath"
     }
     try { $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
     catch {
         $script:Stage = 'INSTALLING'
         Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_STATE' "Could not parse $statePath : $($_.Exception.Message)"
     }
-    if ([int]$state.SchemaVersion -ne 1 -or "$($state.RunDir)" -ine $runPath) {
+    foreach ($required in @('SchemaVersion','RunId','RunDir','InstallerStarted','Stage')) {
+        if ($state.PSObject.Properties.Name -notcontains $required) {
+            $script:Stage = 'INSTALLING'
+            Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_STATE' "Recovery state is missing '$required'. No automatic action was taken."
+        }
+    }
+    if ([int]$state.SchemaVersion -ne 1 -or
+        "$($state.RunDir)" -ine $runPath -or
+        "$($state.RunId)" -cne $runLeaf -or
+        "$($state.RunId)" -cne "$($marker.RunId)" -or
+        "$($state.Stage)" -cne "$($marker.Stage)" -or
+        [bool]$state.InstallerStarted -ne [bool]$marker.InstallerStarted) {
         $script:Stage = 'INSTALLING'
-        Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_STATE' 'Recovery manifest schema or run-directory binding is invalid.'
+        Complete-Run $EXIT.ESCALATE 'INVALID_RECOVERY_STATE' 'Recovery marker/state schema, run ID, stage, or run-directory binding is invalid.'
     }
 
     $script:RunDir = $runPath
@@ -1846,8 +2180,7 @@ function Invoke-ExplicitRecovery {
         }
         $postInstallJobsPath = Join-Path $runPath 'disabled-jobs.json'
         try {
-            if (-not (Test-Path -LiteralPath $postInstallJobsPath)) { throw 'disabled-jobs.json is missing' }
-            if (-not (Test-TrustedOwner $postInstallJobsPath)) { throw 'disabled-jobs.json is not owned by SYSTEM or Administrators' }
+            if (-not (Test-RegularTrustedFile $postInstallJobsPath)) { throw 'disabled-jobs.json is missing, reparse-backed, or writable by an untrusted principal' }
             $recordedJobs = @(Get-Content -LiteralPath $postInstallJobsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
             $script:DisabledJobs = @($recordedJobs)
             $script:Report.JobsLeftDisabled = (Get-UnrestoredJobNames -Records $recordedJobs) -join ', '
@@ -1874,7 +2207,7 @@ function Invoke-ExplicitRecovery {
     $pgPath = Join-Path $runPath 'pg-service-state.json'
 
     try {
-        if (-not (Test-Path -LiteralPath $jobsPath)) { throw 'disabled-jobs.json is missing' }
+        if (-not (Test-RegularTrustedFile $jobsPath)) { throw 'disabled-jobs.json is missing or untrusted' }
         $script:DisabledJobs = @(Get-Content $jobsPath -Raw | ConvertFrom-Json)
         foreach ($jobRecord in $script:DisabledJobs) {
             foreach ($field in @('Family','Id','Name','WasEnabled')) {
@@ -1886,7 +2219,7 @@ function Invoke-ExplicitRecovery {
 
     if ($script:Stage -eq 'SERVICES_STOPPED') {
         try {
-            if (-not (Test-Path -LiteralPath $pgPath)) { throw 'pg-service-state.json is missing' }
+            if (-not (Test-RegularTrustedFile $pgPath)) { throw 'pg-service-state.json is missing or untrusted' }
             $pgState = Get-Content $pgPath -Raw | ConvertFrom-Json
             $script:PgServiceName = "$($pgState.Name)"
             $pgTypeForStart = if ([bool]$pgState.WasRunning -and "$($pgState.StartupType)" -eq 'Disabled') { 'Manual' } else { "$($pgState.StartupType)" }
@@ -1917,6 +2250,7 @@ function Invoke-ExplicitRecovery {
 
         try {
             if (Test-Path -LiteralPath $natsPath) {
+                if (-not (Test-RegularTrustedFile $natsPath)) { throw 'nats-service-state.json is untrusted' }
                 $natsState = Get-Content $natsPath -Raw | ConvertFrom-Json
                 $natsTypeForStart = if ([bool]$natsState.WasRunning -and "$($natsState.StartupType)" -eq 'Disabled') { 'Manual' } else { "$($natsState.StartupType)" }
                 Set-ServiceStartupTypeExact -Name "$($natsState.Name)" -StartupType $natsTypeForStart
@@ -1937,7 +2271,7 @@ function Invoke-ExplicitRecovery {
         } catch { $problems += "NATS restore: $($_.Exception.Message)" }
 
         try {
-            if (-not (Test-Path -LiteralPath $servicePath)) { throw 'veeam-service-state.json is missing' }
+            if (-not (Test-RegularTrustedFile $servicePath)) { throw 'veeam-service-state.json is missing or untrusted' }
             $script:VeeamServices = @(Get-Content $servicePath -Raw | ConvertFrom-Json)
             $problems += @(Restore-VeeamServiceState -AllowStops:$false)
         } catch { $problems += "Veeam service restore: $($_.Exception.Message)" }
@@ -1990,81 +2324,19 @@ function Invoke-ExplicitRecovery {
 }
 
 # ---------------------------------------------------------------------------
-# STEP 1 - Load operator config
+# STEP 1 - Load built-in settings
 # ---------------------------------------------------------------------------
 Write-Log 'STEP 1 - Load settings' STEP
 
-# The script carries its own settings, so an RMM that uploads only this one file
-# just works. An override file is optional and only changes the keys it contains.
-function Test-TrustedOwner {
-    param([string] $Path)
-    try {
-        $owner = (Get-Acl -LiteralPath $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-        return ($owner -eq 'S-1-5-18' -or $owner -eq 'S-1-5-32-544')
-    } catch { return $false }
-}
-
 $Cfg = Get-DefaultConfig
-$overridePath = $null
-
-if ($ConfigPath) {
-    # Asked for explicitly, so a missing file is an error, not a fallback.
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        Complete-Run $EXIT.PREFLIGHT 'NO_CONFIG' "You passed -ConfigPath but the file does not exist: $ConfigPath"
-    }
-    if (-not (Test-TrustedOwner $ConfigPath)) {
-        Complete-Run $EXIT.PREFLIGHT 'UNTRUSTED_CONFIG' "The settings file is not owned by SYSTEM or Administrators and will not be executed as trusted RMM input: $ConfigPath"
-    }
-    $overridePath = $ConfigPath
-} else {
-    $workRootCfg = Join-Path $WorkRoot 'config.json'
-    if (Test-Path -LiteralPath $workRootCfg) {
-        # This script runs as SYSTEM. Only honour a settings file that a
-        # non-admin could not have planted.
-        if (Test-TrustedOwner $workRootCfg) { $overridePath = $workRootCfg }
-        else { Write-Log "Ignoring $workRootCfg - it is not owned by SYSTEM or Administrators, so it cannot be trusted." WARN }
-    }
-    if (-not $overridePath -and $PSScriptRoot) {
-        $besideCfg = Join-Path $PSScriptRoot 'VeeamPostgresUpdate.config.json'
-        if (Test-Path -LiteralPath $besideCfg) {
-            if (Test-TrustedOwner $besideCfg) { $overridePath = $besideCfg }
-            else { Write-Log "Ignoring $besideCfg - it is not owned by SYSTEM or Administrators, so it cannot be trusted." WARN }
-        }
-    }
-}
-
-if ($overridePath) {
-    try {
-        $override = Get-Content -LiteralPath $overridePath -Raw | ConvertFrom-Json
-    } catch {
-        Complete-Run $EXIT.PREFLIGHT 'BAD_CONFIG' "Could not parse the settings override $overridePath : $($_.Exception.Message)"
-    }
-    $knownKeys = @((Get-DefaultConfig).PSObject.Properties.Name)
-    foreach ($n in @($override.PSObject.Properties.Name)) {
-        if ($n -notlike '_*' -and $knownKeys -notcontains $n) {
-            if ($n -in @('approvedTargets','supportedBranches','branchFloors')) {
-                Write-Log "Override key '$n' has been removed and is ignored. Target selection always uses the latest minor on the installed PostgreSQL major branch." WARN
-            } elseif ($n -in @('abortIfVeeamOnePresent','abortIfRemoteVb365Proxies')) {
-                Write-Log "Override key '$n' has been removed and is ignored. Unsupported topologies are always rejected; this safety check cannot be disabled." WARN
-            } elseif ($n -eq 'reapplyTuning') {
-                Write-Log "Override key '$n' has been removed and is ignored. Veeam PostgreSQL tuning is mandatory after every update." WARN
-            } else {
-                Write-Log "Override key '$n' is not a setting this script uses and is ignored - check for a typo." WARN
-            }
-        }
-    }
-    $Cfg = Merge-Config $Cfg $override
-    Write-Log "Settings: built-in, overridden by $overridePath" OK
-} else {
-    Write-Log 'Settings: built-in' OK
-}
+Write-Log 'Settings: built-in; external override files are not supported' OK
 Write-Log 'PostgreSQL target policy: latest published minor on the installed major branch'
 
 # Housekeeping, every run - audit runs included, or daily audits pile up forever.
 # retentionDays covers transcripts AND recovery sets. Unresolved evidence and the
 # two newest completed recovery sets (including their transcripts) are retained
 # regardless of age. Deletion is limited to an owned, normalized runs directory.
-if ($script:WorkRootIsOurs) {
+if ($script:WorkRootProtected) {
     $retain = 30
     try { $retain = [int](Get-CfgValue $Cfg 'retentionDays' 30) } catch {}
     if ($retain -lt 1) { $retain = 30 }
@@ -2077,57 +2349,77 @@ if ($script:WorkRootIsOurs) {
     $protectEveryRun = $false
 
     if (Test-Path -LiteralPath $runsRoot) {
-        $runsRootFull = [IO.Path]::GetFullPath($runsRoot).TrimEnd('\') + '\'
-        foreach ($rd in @(Get-ChildItem -LiteralPath $runsRoot -Directory -ErrorAction SilentlyContinue)) {
-            $manifest = $null
-            foreach ($candidate in @((Join-Path $rd.FullName 'recovery-state.json'), (Join-Path $rd.FullName 'result.json'))) {
-                if (-not (Test-Path -LiteralPath $candidate)) { continue }
-                try { $manifest = Get-Content -LiteralPath $candidate -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop; break }
-                catch { $manifest = $null }
-            }
-            $manifestStage = if ($manifest -and $manifest.PSObject.Properties.Name -contains 'Stage') { "$($manifest.Stage)" } else { '' }
-            $manifestLog = if ($manifest -and $manifest.PSObject.Properties.Name -contains 'LogPath') { "$($manifest.LogPath)" } else { '' }
-            if ($manifestStage -eq 'COMPLETE') {
-                $completedRuns += [pscustomobject]@{ Path=$rd.FullName; LogPath=$manifestLog; LastWriteTime=$rd.LastWriteTime }
-            } else {
-                # Empty abandoned directories have no recovery value; every
-                # non-empty run lacking a COMPLETE record is treated as unresolved.
-                $isEmpty = @(Get-ChildItem -LiteralPath $rd.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
-                if (-not $isEmpty) {
-                    [void]$protectedRuns.Add([IO.Path]::GetFullPath($rd.FullName).TrimEnd('\'))
-                    if ($manifestLog) { [void]$protectedLogs.Add([IO.Path]::GetFullPath($manifestLog)) }
+        if (Test-PathTreeHasReparsePoint -Path $runsRoot) {
+            $protectEveryRun = $true
+            Write-Log 'Skipping recovery-set housekeeping because the runs path contains a reparse point.' WARN
+        } else {
+            $runsRootFull = [IO.Path]::GetFullPath($runsRoot).TrimEnd('\') + '\'
+            foreach ($rd in @(Get-ChildItem -LiteralPath $runsRoot -Directory -ErrorAction SilentlyContinue)) {
+                $fullRun = [IO.Path]::GetFullPath($rd.FullName).TrimEnd('\')
+                if (($rd.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    [IO.Directory]::GetParent($fullRun).FullName.TrimEnd('\') -ine $runsRootFull.TrimEnd('\') -or
+                    $rd.Name -notmatch '^\d{8}-\d{6}-\d{3}-\d+$' -or
+                    (Test-PathTreeHasReparsePoint -Path $fullRun)) {
+                    [void]$protectedRuns.Add($fullRun)
+                    continue
+                }
+                $manifest = Get-ValidatedCompletedRunManifest -RunDirectory $fullRun
+                $manifestStage = if ($manifest) { 'COMPLETE' } else { '' }
+                $manifestLog = if ($manifest -and $manifest.PSObject.Properties.Name -contains 'LogPath') { "$($manifest.LogPath)" } else { '' }
+                if ($manifestStage -eq 'COMPLETE') {
+                    $completedRuns += [pscustomobject]@{ Path=$rd.FullName; LogPath=$manifestLog; LastWriteTime=$rd.LastWriteTime }
+                } else {
+                    # Empty abandoned directories have no recovery value; every
+                    # non-empty run lacking a COMPLETE record is treated as unresolved.
+                    $isEmpty = @(Get-ChildItem -LiteralPath $rd.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0
+                    if (-not $isEmpty) {
+                        [void]$protectedRuns.Add($fullRun)
+                        if ($manifestLog) { [void]$protectedLogs.Add([IO.Path]::GetFullPath($manifestLog)) }
+                    }
                 }
             }
-        }
 
-        foreach ($keep in @($completedRuns | Sort-Object LastWriteTime -Descending | Select-Object -First 2)) {
-            [void]$protectedRuns.Add([IO.Path]::GetFullPath($keep.Path).TrimEnd('\'))
-            if ($keep.LogPath) { [void]$protectedLogs.Add([IO.Path]::GetFullPath($keep.LogPath)) }
-        }
+            foreach ($keep in @($completedRuns | Sort-Object LastWriteTime -Descending | Select-Object -First 2)) {
+                [void]$protectedRuns.Add([IO.Path]::GetFullPath($keep.Path).TrimEnd('\'))
+                if ($keep.LogPath) { [void]$protectedLogs.Add([IO.Path]::GetFullPath($keep.LogPath)) }
+            }
 
-        if (Test-Path -LiteralPath $script:MarkerFile) {
-            $protectEveryRun = $true
-            try {
-                $markerForRetention = Get-Content -LiteralPath $script:MarkerFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                $markedRun = [IO.Path]::GetFullPath("$($markerForRetention.RunDir)").TrimEnd('\')
-                if (($markedRun + '\').StartsWith($runsRootFull, [StringComparison]::OrdinalIgnoreCase)) { [void]$protectedRuns.Add($markedRun) }
-            } catch {}
-        }
+            if (Test-Path -LiteralPath $script:MarkerFile) {
+                $protectEveryRun = $true
+                if (Test-RegularTrustedFile $script:MarkerFile) {
+                    try {
+                        $markerForRetention = Get-Content -LiteralPath $script:MarkerFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                        $markedRun = [IO.Path]::GetFullPath("$($markerForRetention.RunDir)").TrimEnd('\')
+                        if (($markedRun + '\').StartsWith($runsRootFull, [StringComparison]::OrdinalIgnoreCase)) { [void]$protectedRuns.Add($markedRun) }
+                    } catch {}
+                }
+            }
 
-        foreach ($rd in @(Get-ChildItem -LiteralPath $runsRoot -Directory -ErrorAction SilentlyContinue)) {
-            $fullRun = [IO.Path]::GetFullPath($rd.FullName).TrimEnd('\')
-            if ($protectEveryRun -or $protectedRuns.Contains($fullRun) -or $fullRun -eq [IO.Path]::GetFullPath($script:RunDir).TrimEnd('\')) { continue }
-            $isEmpty = @(Get-ChildItem -LiteralPath $fullRun -Force -ErrorAction SilentlyContinue).Count -eq 0
-            if (($isEmpty -or $rd.LastWriteTime -lt $cutoff) -and (($fullRun + '\').StartsWith($runsRootFull, [StringComparison]::OrdinalIgnoreCase))) {
-                Write-Log "  purging completed run folder $($rd.Name)$(if ($isEmpty) { ' (empty)' })"
-                Remove-Item -LiteralPath $fullRun -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($rd in @(Get-ChildItem -LiteralPath $runsRoot -Directory -ErrorAction SilentlyContinue)) {
+                $fullRun = [IO.Path]::GetFullPath($rd.FullName).TrimEnd('\')
+                if ($protectEveryRun -or $protectedRuns.Contains($fullRun) -or $fullRun -eq [IO.Path]::GetFullPath($script:RunDir).TrimEnd('\')) { continue }
+                if (($rd.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    [IO.Directory]::GetParent($fullRun).FullName.TrimEnd('\') -ine $runsRootFull.TrimEnd('\') -or
+                    $rd.Name -notmatch '^\d{8}-\d{6}-\d{3}-\d+$' -or
+                    (Test-PathTreeHasReparsePoint -Path $fullRun)) { continue }
+                $isEmpty = @(Get-ChildItem -LiteralPath $fullRun -Force -ErrorAction SilentlyContinue).Count -eq 0
+                if (($isEmpty -or $rd.LastWriteTime -lt $cutoff) -and (($fullRun + '\').StartsWith($runsRootFull, [StringComparison]::OrdinalIgnoreCase))) {
+                    if (Test-PathTreeHasReparsePoint -Path $fullRun -IncludeDescendants) {
+                        Write-Log "  retaining $($rd.Name) because it contains a reparse point" WARN
+                        continue
+                    }
+                    Write-Log "  purging completed run folder $($rd.Name)$(if ($isEmpty) { ' (empty)' })"
+                    Remove-Item -LiteralPath $fullRun -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
         }
     }
 
     foreach ($log in @(Get-ChildItem -LiteralPath $script:LogDir -File -Filter 'VeeamPgUpdate_*.log' -ErrorAction SilentlyContinue)) {
         $fullLog = [IO.Path]::GetFullPath($log.FullName)
-        if (-not $protectEveryRun -and $log.LastWriteTime -lt $cutoff -and -not $protectedLogs.Contains($fullLog)) {
+        if (($log.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
+            [IO.Directory]::GetParent($fullLog).FullName.TrimEnd('\') -ieq [IO.Path]::GetFullPath($script:LogDir).TrimEnd('\') -and
+            -not $protectEveryRun -and $log.LastWriteTime -lt $cutoff -and -not $protectedLogs.Contains($fullLog)) {
             Remove-Item -LiteralPath $fullLog -Force -ErrorAction SilentlyContinue
         }
     }
@@ -2968,7 +3260,7 @@ if (-not $Install) {
 # The work root will hold database dumps, service/job state, and recovery evidence.
 # If it could not be locked down, do not put those privileged artifacts in it.
 if (-not $script:WorkRootProtected) {
-    Complete-Run $EXIT.PREFLIGHT 'WORKROOT_UNSAFE' "The work root is not locked to SYSTEM and Administrators ($($wrInit.Reason)). Refusing to write database dumps or privileged recovery state there. Use the default -WorkRoot, or point it at a new or empty folder."
+    Complete-Run $EXIT.PREFLIGHT 'WORKROOT_UNSAFE' "The work root is not locked to SYSTEM and Administrators ($($wrInit.Reason)). Refusing to write database dumps or privileged recovery state there. Use the default WorkRoot with a safe parent, or a protected custom path."
 }
 New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
 Write-Log "Run folder: $($script:RunDir)"
@@ -3502,7 +3794,15 @@ Write-Log 'PostgreSQL stopped' OK
 Write-Log 'STEP 16 - Cold copy of the PostgreSQL data directory' STEP
 
 $coldCopy = Join-Path $backupDir 'datadir'
-$rc = Invoke-Native 'robocopy.exe' @($pg.DataDir, $coldCopy, '/E', '/COPYALL', '/DCOPY:DAT', '/R:1', '/W:1', '/XJ', '/NFL', '/NDL', '/NP', '/NJH', '/NJS')
+$coldCopyAcl = Join-Path $backupDir 'datadir-acl.txt'
+$icaclsPath = Join-Path $env:SystemRoot 'System32\icacls.exe'
+$aclCapture = Invoke-Native $icaclsPath @($pg.DataDir, '/save', $coldCopyAcl, '/t', '/q')
+if ($aclCapture.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $coldCopyAcl) -or (Get-Item -LiteralPath $coldCopyAcl).Length -eq 0) {
+    Complete-Run $EXIT.PREFLIGHT 'COLD_COPY_ACL_CAPTURE_FAILED' "Could not capture the original PostgreSQL data-directory DACLs before the cold copy (exit $($aclCapture.ExitCode)). PostgreSQL was NOT modified. $($aclCapture.StdErr)"
+}
+# Do not import PostgreSQL/service-account ACLs into the protected recovery tree.
+# The original DACLs are retained separately in datadir-acl.txt for manual restore.
+$rc = Invoke-Native 'robocopy.exe' @($pg.DataDir, $coldCopy, '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/XJ', '/NFL', '/NDL', '/NP', '/NJH', '/NJS')
 # robocopy exit codes below 8 are success
 if ($rc.ExitCode -ge 8) {
     Complete-Run $EXIT.PREFLIGHT 'COLD_COPY_FAILED' "robocopy of the data directory failed (exit $($rc.ExitCode)). PostgreSQL was NOT modified. $($rc.StdErr)"
