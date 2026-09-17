@@ -1,0 +1,8 @@
+{
+  "_comment": "OPTIONAL. The script carries its own defaults. Copy this file to <WorkRoot>/config.json (default C:/ProgramData/VeeamPgUpdate/config.json), then keep only the settings you are changing. The file is honoured only when owned by SYSTEM or Administrators. Version selection and Veeam PostgreSQL tuning are mandatory policies, not configurable settings.",
+  "_retention_note": "retentionDays covers transcript logs and completed recovery sets. Recovery sets include database dumps, configuration copies, the cold data-directory copy, service/job state, and installer logs. Unresolved runs and the two newest completed recovery sets are retained regardless of age.",
+
+  "jobWaitTimeoutMinutes": 720,
+  "installerTimeoutMinutes": 120,
+  "retentionDays": 60
+}
