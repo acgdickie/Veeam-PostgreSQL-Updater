@@ -52,7 +52,11 @@ Check 'ConfigPath parameter removed'    ($scriptParameterNames -contains 'Config
 Check 'Install parameter remains'       ($scriptParameterNames -contains 'Install')       'True'
 Check 'Recover parameter exposed'       ($scriptParameterNames -contains 'Recover')       'True'
 $workRootParameter = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'WorkRoot' })[0]
-Check 'WorkRoot default is C:\temp\VeeamPgUpdate' $workRootParameter.DefaultValue.Value 'C:\temp\VeeamPgUpdate'
+Check 'WorkRoot default is C:\ProgramData\VeeamPgUpdate' $workRootParameter.DefaultValue.Value 'C:\ProgramData\VeeamPgUpdate'
+$legacyFunction = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-TrustedLegacyRecoveryMarker' }, $true))[0]
+$legacyDefault = @($legacyFunction.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'LegacyWorkRoot' })[0].DefaultValue.Value
+Check 'former default checked is C:\temp\VeeamPgUpdate' $legacyDefault 'C:\temp\VeeamPgUpdate'
+Check 'script no longer creates C:\temp' ((Get-Content -LiteralPath $script:Path -Raw) -match "-ine 'C:\\temp'") 'False'
 $functionNames = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
 Check 'Merge-Config function removed' ($functionNames -contains 'Merge-Config') 'False'
 

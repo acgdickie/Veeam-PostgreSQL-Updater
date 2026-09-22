@@ -44,7 +44,7 @@
     exits 40 or 50 for an operator; it never rolls database files back automatically.
 
 .PARAMETER WorkRoot
-    Local folder for logs, dumps and the cold copy. Default C:\temp\VeeamPgUpdate
+    Local folder for logs, dumps and the cold copy. Default C:\ProgramData\VeeamPgUpdate
     The folder and its parent must pass ownership, ACL and reparse-point checks.
     Logs are written here only after those checks pass, and pruned after retentionDays.
 
@@ -85,7 +85,7 @@ param(
     [switch] $Install,
     [switch] $Reboot,
     [switch] $Recover,
-    [string] $WorkRoot = 'C:\temp\VeeamPgUpdate',
+    [string] $WorkRoot = 'C:\ProgramData\VeeamPgUpdate',
     [switch] $SkipDownloadInAudit
 )
 
@@ -848,7 +848,8 @@ trap {
 #
 # The work root holds a downloaded installer, privileged database dumps and a
 # cold copy. A marker filename alone is not proof that the folder is ours: an
-# ordinary user could plant that marker and junctions below a writable C:\temp.
+# ordinary user could plant that marker and junctions below a writable parent
+# such as a typical C:\temp.
 # These helpers fail closed on reparse points and verify the exact ACL we set.
 # Well-known SIDs keep the checks language-neutral.
 # ---------------------------------------------------------------------------
@@ -1095,7 +1096,7 @@ function Test-WorkRootSentinel {
 function Get-TrustedLegacyRecoveryMarker {
     param(
         [Parameter(Mandatory)][string] $CurrentWorkRoot,
-        [string] $LegacyWorkRoot = 'C:\ProgramData\VeeamPgUpdate'
+        [string] $LegacyWorkRoot = 'C:\temp\VeeamPgUpdate'
     )
     try {
         $current = [IO.Path]::GetFullPath($CurrentWorkRoot).TrimEnd('\')
@@ -1147,15 +1148,9 @@ function Initialize-WorkRoot {
 
     $parent = [IO.Directory]::GetParent($full).FullName
     if (-not (Test-Path -LiteralPath $parent)) {
-        # The documented default remains self-starting. No other missing parent is
-        # created because taking over an arbitrary parent would be destructive.
-        if ($full -ine 'C:\temp\VeeamPgUpdate' -or $parent -ine 'C:\temp') {
-            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="parent directory does not exist: $parent" }
-        }
-        $grandParent = [IO.Directory]::GetParent($parent).FullName
-        if (-not (Test-SafeWorkRootParent $grandParent) -or -not (New-ProtectedDirectory $parent)) {
-            return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="could not create a protected default parent: $parent" }
-        }
+        # A missing parent is never created: taking over an arbitrary parent would
+        # be destructive. The default's parent, C:\ProgramData, always exists.
+        return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="parent directory does not exist: $parent" }
     }
     if (-not (Test-SafeWorkRootParent $parent)) {
         return [pscustomobject]@{ IsOurs=$false; Protected=$false; Path=$full; Reason="parent directory is replaceable or not trusted: $parent" }
@@ -1210,7 +1205,9 @@ function Initialize-WorkRoot {
 # Changing the default must not hide an interrupted run from an older deployment.
 # A trusted marker under the former default is handled only from that original
 # WorkRoot so all recorded paths stay bound to the evidence that created them.
-$legacyWorkRoot = 'C:\ProgramData\VeeamPgUpdate'
+# The default moved back from C:\temp\VeeamPgUpdate to C:\ProgramData\VeeamPgUpdate
+# because an existing C:\temp is normally writable by every signed-in user.
+$legacyWorkRoot = 'C:\temp\VeeamPgUpdate'
 $legacyMarker = Get-TrustedLegacyRecoveryMarker -CurrentWorkRoot $WorkRoot -LegacyWorkRoot $legacyWorkRoot
 if ($legacyMarker) {
     $script:Report.IssueCode = 'LEGACY_WORKROOT_RECOVERY_REQUIRED'
@@ -2584,6 +2581,7 @@ function Get-VeeamControlSurfaceValidation {
         Kind      = 'OK'
         IssueCode = ''
         Detail    = ''
+        Action    = ''   # specific RMM ActionRequired text, when there is a clear fix
         Inventory = @()
     }
 
@@ -2600,9 +2598,17 @@ function Get-VeeamControlSurfaceValidation {
             'Get-VBORepositoryMaintenanceSession','Stop-VBORepositoryMaintenanceSession') |
             Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
         if (@($missingMaintenanceCommands).Count -gt 0) {
+            # Repository maintenance mode (Start/Get/Stop-VBORepositoryMaintenanceSession)
+            # is new in VB365 8.6, build 8.6.0.1102:
+            # https://helpcenter.veeam.com/docs/vbo365/powershell/start-vborepositorymaintenancesession.html
+            # Read $products defensively: this function is also exercised on its own by the tests.
+            $knownProducts = @(Get-Variable -Name products -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+            $vb365Record = @($knownProducts | Where-Object { $_ -and $_.Name -eq 'VB365' }) | Select-Object -First 1
+            $vb365Version = if ($vb365Record) { "$($vb365Record.Version)" } else { 'Unknown' }
             $result.Kind = 'UNSUPPORTED'
             $result.IssueCode = 'VB365_MAINTENANCE_API_UNAVAILABLE'
-            $result.Detail = "Safe VB365 maintenance requires the repository-maintenance API. Missing: $($missingMaintenanceCommands -join ', ')."
+            $result.Detail = "VB365 $vb365Version is installed. Safe VB365 maintenance needs repository maintenance mode, which is new in VB365 8.6 (build 8.6.0.1102). Missing: $($missingMaintenanceCommands -join ', ')."
+            $result.Action = 'Upgrade Veeam Backup for Microsoft 365 to 8.6 or later, then rerun the audit.'
             return [pscustomobject]$result
         }
     }
@@ -3057,6 +3063,7 @@ Write-Log 'STEP 6B - Validate Veeam scheduling, activity and topology APIs' STEP
 $controlValidation = Get-VeeamControlSurfaceValidation -Vbr $hasVbr -Vb365 $hasVb365
 if ($controlValidation.Kind -ne 'OK') {
     $validationCode = if ($controlValidation.Kind -eq 'UNSUPPORTED') { $EXIT.UNSUPPORTED } else { $EXIT.PREFLIGHT }
+    if ($controlValidation.Action) { $script:Report.ActionRequired = $controlValidation.Action }
     Complete-Run $validationCode $controlValidation.IssueCode $controlValidation.Detail
 }
 $script:ManagedJobInventory = @($controlValidation.Inventory)
@@ -3316,6 +3323,7 @@ Write-Log 'STEP 11 - Inventory schedules and wait for jobs/restores to finish na
 $controlValidation = Get-VeeamControlSurfaceValidation -Vbr $hasVbr -Vb365 $hasVb365 -Reconnect:$hasVb365
 if ($controlValidation.Kind -ne 'OK') {
     $validationCode = if ($controlValidation.Kind -eq 'UNSUPPORTED') { $EXIT.UNSUPPORTED } else { $EXIT.PREFLIGHT }
+    if ($controlValidation.Action) { $script:Report.ActionRequired = $controlValidation.Action }
     Complete-Run $validationCode $controlValidation.IssueCode $controlValidation.Detail
 }
 $script:ManagedJobInventory = @($controlValidation.Inventory)

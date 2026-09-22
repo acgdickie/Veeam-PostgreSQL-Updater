@@ -135,7 +135,7 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | `-Install` | off | Actually do the update. Without it, audit only |
 | `-Reboot` | off | Compatibility switch only. It is accepted but safely deferred to the RMM; the script never invokes shutdown |
 | `-Recover` | off | Validate and restore captured state from an interrupted pre-installer run; post-installer use is diagnostic-only |
-| `-WorkRoot` | `C:\temp\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
+| `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
 | `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
@@ -368,7 +368,7 @@ persistent EOL result `7`.
 ## Where the evidence lives
 
 ```
-C:\temp\VeeamPgUpdate\
+C:\ProgramData\VeeamPgUpdate\
   CHANGES-IN-PROGRESS.marker   present only mid-change, or after a run that needs a human
   .veeam-pg-updater            marks the folder as created by the script
   logs\
@@ -402,22 +402,26 @@ paths are checked again before use, and a run is recursively checked for reparse
 before retention can delete it. A marker filename by itself is not trusted. Failure returns
 `WORKROOT_UNSAFE` (exit 20) and writes no file in the rejected location.
 
-On first use, the documented default can securely create `C:\temp` when that directory is
-absent, then creates `C:\temp\VeeamPgUpdate`. If `C:\temp` already exists but a normal user
-can replace its children, the script deliberately leaves it unchanged and refuses to run;
-secure that parent or choose another protected local path. A custom WorkRoot's parent must
-already exist, and every ancestor must be non-reparse and non-replaceable. Existing
+The default is `C:\ProgramData\VeeamPgUpdate`. `C:\ProgramData` exists on every Windows
+server and ordinary users cannot delete or replace what is in it, so the script can create
+its folder there safely. Do not use a folder under a typical `C:\temp`: every signed-in user
+can normally change it, so the script refuses (`WORKROOT_UNSAFE`). A custom WorkRoot's
+parent must already exist, and every ancestor must be non-reparse and non-replaceable. Existing
 non-empty WorkRoots are used only when they have the exact protected ACL and trusted
 sentinel created by this script.
 An existing empty WorkRoot must already have that exact protected ACL before the script will
 claim it. Drive roots, UNC paths, relative paths, foreign content, forged
 sentinels, and reparse points are rejected without changing their contents or permissions.
 
-If upgrading from a release that used `C:\ProgramData\VeeamPgUpdate`, the script checks that
+If upgrading from the release that used `C:\temp\VeeamPgUpdate`, the script checks that
 former location for a trusted changes-in-progress marker. It returns
 `LEGACY_WORKROOT_RECOVERY_REQUIRED` (exit 40) rather than hiding an interrupted run. Follow
-the RMM instruction to run `-Recover -WorkRoot C:\ProgramData\VeeamPgUpdate`; after recovery,
-normal runs can use the new default.
+the RMM instruction to run `-Recover -WorkRoot C:\temp\VeeamPgUpdate`; after recovery,
+normal runs can use the default.
+
+A `C:\ProgramData\VeeamPgUpdate` folder left by an older test version of the script is
+refused (`WORKROOT_UNSAFE`) because the script cannot prove it created it. If it holds no
+`CHANGES-IN-PROGRESS.marker`, rename it and run again.
 
 **Housekeeping runs every time**, audits included:
 
