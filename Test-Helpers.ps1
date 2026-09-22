@@ -10,7 +10,7 @@ if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native',
-        'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName',
+        'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
         'Protect-Folder','New-ProtectedDirectory','Test-WorkRootSentinel','Get-TrustedLegacyRecoveryMarker',
@@ -262,6 +262,22 @@ Check 'connection out-of-range port throws' (Throws { ConvertFrom-PgConnectionSt
 Check 'VB365 cache GUID name accepted' (Test-Vb365CacheDatabaseName 'cache_12345678-1234-1234-1234-1234567890ab') 'True'
 Check 'VB365 cache compact GUID accepted' (Test-Vb365CacheDatabaseName 'cache_123456781234123412341234567890ab') 'True'
 Check 'VB365 cache non-GUID rejected' (Test-Vb365CacheDatabaseName 'cache_customerdata') 'False'
+# Proxy.xml holds the pattern cache_{0}, not a real name (seen on ACAVBM01, 2026-09-22).
+Check 'VB365 cache pattern accepted'     (Test-Vb365CacheDatabaseTemplate 'cache_{0}') 'True'
+Check 'VB365 upper-case pattern rejected' (Test-Vb365CacheDatabaseTemplate 'CACHE_{0}') 'False'
+Check 'VB365 cache upper-hex GUID accepted' (Test-Vb365CacheDatabaseName 'cache_12345678-ABCD-1234-1234-1234567890AB') 'True'
+Check 'VB365 cache braced GUID rejected'   (Test-Vb365CacheDatabaseName 'cache_{12345678-1234-1234-1234-1234567890ab}') 'False'
+Check 'VB365 cache 0x GUID rejected'       (Test-Vb365CacheDatabaseName 'cache_(12345678-1234-1234-1234-1234567890ab)') 'False'
+Check 'VB365 cache upper prefix rejected'  (Test-Vb365CacheDatabaseName 'CACHE_12345678-1234-1234-1234-1234567890ab') 'False'
+Check 'VB365 cache GUID + junk rejected'   (Test-Vb365CacheDatabaseName 'cache_12345678-1234-1234-1234-1234567890abX') 'False'
+Check 'VB365 cache pattern + junk rejected' (Test-Vb365CacheDatabaseTemplate 'cache_{0}x') 'False'
+Check 'VB365 other pattern rejected'     (Test-Vb365CacheDatabaseTemplate 'cache_{1}') 'False'
+Check 'VB365 real name is not a pattern' (Test-Vb365CacheDatabaseTemplate 'cache_12345678-1234-1234-1234-1234567890ab') 'False'
+Check 'VB365 config DB is not a pattern' (Test-Vb365CacheDatabaseTemplate 'VeeamBackup365') 'False'
+Check 'VB365 empty is not a pattern'     (Test-Vb365CacheDatabaseTemplate '') 'False'
+Check 'VB365 pattern is not a real name' (Test-Vb365CacheDatabaseName 'cache_{0}') 'False'
+try { $tpl = ConvertFrom-PgConnectionString 'Host=localhost;Port=5432;Database=cache_{0};Username=postgres' } catch { $tpl = $null }
+Check 'cache pattern connection parses'  ($null -ne $tpl -and $tpl.Database -eq 'cache_{0}' -and $tpl.Port -eq 5432) 'True'
 
 Check 'blank DB host means local'      (Test-LocalDbHost '')          'True'
 Check 'localhost exact is local'       (Test-LocalDbHost 'localhost') 'True'

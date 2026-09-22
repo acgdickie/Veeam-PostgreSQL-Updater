@@ -2670,9 +2670,22 @@ function ConvertFrom-PgConnectionString {
 
 function Test-Vb365CacheDatabaseName {
     param([string] $Database)
-    if (-not $Database -or -not $Database.StartsWith('cache_', [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    $cacheId = [guid]::Empty
-    return [guid]::TryParse($Database.Substring(6), [ref]$cacheId)
+    if (-not $Database) { return $false }
+    # Exactly cache_ plus a GUID in one of the two forms .NET writes by default:
+    # with hyphens (D) or without (N). [guid]::TryParse would also accept braced,
+    # bracketed and 0x forms, which VB365 never produces, so a stranger database
+    # could pass as a Veeam cache. The prefix is case-sensitive, like PostgreSQL
+    # database names.
+    return ($Database -cmatch '^cache_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32})$')
+}
+
+# Proxy.xml does not hold a real cache database name. It holds a pattern,
+# 'cache_{0}', and VB365 puts a repository ID in place of {0} for each cache
+# database it creates. Accept only that exact pattern. The real cache_<guid>
+# databases are found later by listing the databases on the server.
+function Test-Vb365CacheDatabaseTemplate {
+    param([string] $Database)
+    return ($null -ne $Database -and $Database -ceq 'cache_{0}')
 }
 
 if ($hasVbr) {
@@ -2712,6 +2725,7 @@ if ($hasVbr) {
     }
 }
 
+$vboCacheTemplatePorts = @()
 if ($hasVb365) {
     $vboCfgXml = 'C:\ProgramData\Veeam\Backup365\Config.xml'
     if (-not (Test-Path $vboCfgXml)) {
@@ -2749,23 +2763,24 @@ if ($hasVb365) {
         Complete-Run $EXIT.PREFLIGHT 'BAD_VB365_PROXY_CONFIG' "Expected exactly one ProxyPostgres node in $vboProxyXml; found $($proxyControllerNodes.Count)."
     }
 
-    $vboConnections = @([pscustomobject]@{ Product='VB365'; Source='Config.xml ControllerPostgres'; Connection=$vboControllerConnection })
+    $vboConnections = @([pscustomobject]@{ Product='VB365'; Source='Config.xml ControllerPostgres'; Connection=$vboControllerConnection; IsTemplate=$false })
     try {
         $proxyControllerString = $proxyControllerNodes[0].GetAttribute('ControllerConnectionString')
         if (-not $proxyControllerString) { throw 'ProxyPostgres ControllerConnectionString is empty' }
         $vboConnections += [pscustomobject]@{
             Product='VB365'; Source='Proxy.xml ProxyPostgres';
-            Connection=(ConvertFrom-PgConnectionString $proxyControllerString)
+            Connection=(ConvertFrom-PgConnectionString $proxyControllerString); IsTemplate=$false
         }
         foreach ($cacheNode in $cacheNodes) {
             $cacheConnectionString = $cacheNode.GetAttribute('PersistentCacheConnectionString')
             if (-not $cacheConnectionString) { throw 'PersistentCachePostgres PersistentCacheConnectionString is empty' }
             $cacheConnection = ConvertFrom-PgConnectionString $cacheConnectionString
-            if (-not (Test-Vb365CacheDatabaseName $cacheConnection.Database)) {
-                throw "Persistent cache database '$($cacheConnection.Database)' is not named cache_<guid>"
+            $isTemplate = Test-Vb365CacheDatabaseTemplate $cacheConnection.Database
+            if (-not $isTemplate -and -not (Test-Vb365CacheDatabaseName $cacheConnection.Database)) {
+                throw "Persistent cache database '$($cacheConnection.Database)' is neither the cache_{0} pattern nor named cache_<guid>"
             }
             $vboConnections += [pscustomobject]@{
-                Product='VB365Cache'; Source='Proxy.xml PersistentCachePostgres'; Connection=$cacheConnection
+                Product='VB365Cache'; Source='Proxy.xml PersistentCachePostgres'; Connection=$cacheConnection; IsTemplate=$isTemplate
             }
         }
     } catch {
@@ -2777,6 +2792,11 @@ if ($hasVb365) {
         Write-Log ("{0}: {1} on {2}:{3}" -f $configuredConnection.Source, $conn.Database, $conn.Host, $conn.Port)
         if (-not (Test-LocalDbHost $conn.Host)) {
             $remoteDatabaseProducts += "$($configuredConnection.Product) $($conn.Database) ($($conn.Host))"
+        } elseif ($configuredConnection.IsTemplate) {
+            # A pattern, not a database. Keep its port so the single-instance check
+            # below still proves the cache databases live on this same PostgreSQL.
+            $vboCacheTemplatePorts += [int]$conn.Port
+            Write-Log '  (pattern only - the real cache_<guid> databases are listed from the server in STEP 6)'
         } else {
             $veeamDatabases += [pscustomobject]@{
                 Product=$configuredConnection.Product; Database=$conn.Database; Port=[int]$conn.Port
@@ -2795,7 +2815,7 @@ if ($veeamDatabases.Count -eq 0) {
     Complete-Run $EXIT.OK 'NOT_APPLICABLE' 'No detected Veeam product uses a local PostgreSQL database.'
 }
 
-$localPgPorts = @($veeamDatabases | ForEach-Object { [int]$_.Port } | Sort-Object -Unique)
+$localPgPorts = @((@($veeamDatabases | ForEach-Object { [int]$_.Port }) + @($vboCacheTemplatePorts)) | Sort-Object -Unique)
 if ($localPgPorts.Count -ne 1) {
     Complete-Run $EXIT.UNSUPPORTED 'MULTIPLE_PG_PORTS' "Local Veeam products report different PostgreSQL ports ($($localPgPorts -join ', ')). Mapping them to one installation is ambiguous; handle manually."
 }
@@ -3475,23 +3495,30 @@ if ($hasVb365) {
     }
 }
 
-# Logical dumps of every Veeam database, plus globals (roles and grants).
-foreach ($db in $veeamDatabases) {
-    if ($db.Database -in @('.','..') -or ("$($db.Database)").IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
-        Complete-Run $EXIT.PREFLIGHT 'UNSAFE_DATABASE_ARTIFACT_NAME' "Database '$($db.Database)' cannot be represented safely as a Windows recovery-artifact filename."
+# Logical dump of one database, checked readable. Also used after Veeam has
+# stopped, for any cache database VB365 created after the list in STEP 6.
+function Backup-VeeamDatabase {
+    param([Parameter(Mandatory)][string] $Database)
+    if ($Database -in @('.','..') -or $Database.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        Complete-Run $EXIT.PREFLIGHT 'UNSAFE_DATABASE_ARTIFACT_NAME' "Database '$Database' cannot be represented safely as a Windows recovery-artifact filename."
     }
-    $dumpFile = Join-Path $backupDir "$($db.Database).dump"
-    Write-Log "pg_dump $($db.Database) -> $dumpFile"
-    $r = Invoke-Native $pgDump @('-U','postgres','-h','127.0.0.1','-p',"$pgPort",'-w','-F','c','-b','-f',$dumpFile,$db.Database)
+    $dumpFile = Join-Path $backupDir "$Database.dump"
+    Write-Log "pg_dump $Database -> $dumpFile"
+    $r = Invoke-Native $pgDump @('-U','postgres','-h','127.0.0.1','-p',"$pgPort",'-w','-F','c','-b','-f',$dumpFile,$Database)
     if ($r.StdErr) { Write-Log "    $($r.StdErr)" WARN }
     if ($r.ExitCode -ne 0 -or -not (Test-Path $dumpFile) -or (Get-Item $dumpFile).Length -lt 10KB) {
-        Complete-Run $EXIT.PREFLIGHT 'DUMP_FAILED' "pg_dump of $($db.Database) failed (exit $($r.ExitCode)) or produced a suspiciously small file. $($r.StdErr)"
+        Complete-Run $EXIT.PREFLIGHT 'DUMP_FAILED' "pg_dump of $Database failed (exit $($r.ExitCode)) or produced a suspiciously small file. $($r.StdErr)"
     }
     $listCheck = Invoke-Native $pgRestore @('--list', $dumpFile)
     if ($listCheck.ExitCode -ne 0 -or -not $listCheck.StdOut) {
-        Complete-Run $EXIT.PREFLIGHT 'DUMP_VERIFY_FAILED' "pg_restore could not read the archive for $($db.Database) (exit $($listCheck.ExitCode)). $($listCheck.StdErr)"
+        Complete-Run $EXIT.PREFLIGHT 'DUMP_VERIFY_FAILED' "pg_restore could not read the archive for $Database (exit $($listCheck.ExitCode)). $($listCheck.StdErr)"
     }
     Write-Log ("  {0:N1} MB" -f ((Get-Item $dumpFile).Length / 1MB)) OK
+}
+
+# Logical dumps of every Veeam database, plus globals (roles and grants).
+foreach ($db in $veeamDatabases) {
+    Backup-VeeamDatabase "$($db.Database)"
 }
 
 $globalsFile = Join-Path $backupDir 'globals.sql'
@@ -3771,6 +3798,34 @@ if ($remainingPgClients.Count -gt 0) {
     Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has untracked client connection(s) after Veeam stopped ($clientSummary). They were not terminated; close or coordinate them, then retry."
 }
 Write-Log 'No other PostgreSQL client sessions remain after Veeam stopped' OK
+
+# Veeam is stopped and nothing else is connected, so the database list cannot
+# change any more. VB365 creates a cache database per repository, and one may
+# have appeared after STEP 6 listed them. Compare now, while PostgreSQL is still
+# running: dump any new cache database; stop on anything else unexpected.
+$finalListRes = Invoke-Psql "SELECT COALESCE(json_agg(datname ORDER BY datname)::text, '[]') FROM pg_database WHERE NOT datistemplate;"
+if ($finalListRes.ExitCode -ne 0 -or -not $finalListRes.StdOut) {
+    Complete-Run $EXIT.PREFLIGHT 'PG_DATABASE_INVENTORY_FAILED' "Could not re-list PostgreSQL databases after Veeam stopped. PostgreSQL was NOT stopped. stderr: $($finalListRes.StdErr)"
+}
+try { $finalDatabases = @($finalListRes.StdOut | ConvertFrom-Json -ErrorAction Stop) }
+catch { Complete-Run $EXIT.PREFLIGHT 'PG_DATABASE_INVENTORY_FAILED' "The database re-list was not valid JSON. PostgreSQL was NOT stopped: $($_.Exception.Message)" }
+
+$dumpedDatabases = @($veeamDatabases | ForEach-Object { "$($_.Database)" })
+$vanishedDatabases = @($dumpedDatabases | Where-Object { $finalDatabases -cnotcontains $_ })
+if ($vanishedDatabases.Count -gt 0) {
+    Complete-Run $EXIT.PREFLIGHT 'VEEAM_DATABASE_MISSING' "Database(s) disappeared while Veeam was stopping: $($vanishedDatabases -join ', '). PostgreSQL was NOT stopped."
+}
+foreach ($databaseName in $finalDatabases) {
+    if ("$databaseName" -ceq 'postgres' -or $dumpedDatabases -ccontains "$databaseName") { continue }
+    if ($hasVb365 -and (Test-Vb365CacheDatabaseName "$databaseName")) {
+        Write-Log "VB365 created cache database $databaseName after STEP 6 - dumping it now" WARN
+        Backup-VeeamDatabase "$databaseName"
+        $veeamDatabases += [pscustomobject]@{ Product='VB365Cache'; Database="$databaseName"; Port=$pgPort }
+        continue
+    }
+    Complete-Run $EXIT.UNSUPPORTED 'UNTRACKED_POSTGRES_DATABASES' "A non-Veeam database appeared while Veeam was stopping: $databaseName. PostgreSQL was NOT stopped."
+}
+Write-Log "Every database is dumped: $($veeamDatabases.Database -join ', ')" OK
 
 if ($script:PgStartupType -eq 'Disabled') {
     # PostgreSQL was running despite a Disabled startup type. Make it temporarily
