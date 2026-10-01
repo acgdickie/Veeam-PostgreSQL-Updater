@@ -1921,15 +1921,60 @@ function Test-NoAllSessionsError {
     return ($message -match 'Specify\s+either\b.*\b(Id|Session)\b')
 }
 
+# Getters proven unusable on this build, so the idle check does not pay for them
+# again. The install path polls this check repeatedly while waiting for Veeam work
+# to finish, and on a VBR 13.0.1 server the dead getters cost ~90 seconds a poll.
+$script:UnusableSessionGetters = @{}
+
+# Fetch the map, creating it on demand. The functions below are also exercised in
+# isolation by the tests, where the script-scope variable does not exist yet, and
+# StrictMode makes reading an unset variable a terminating error.
+function Get-UnusableSessionGetterMap {
+    $map = Get-Variable -Name UnusableSessionGetters -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $map) {
+        $map = @{}
+        Set-Variable -Name UnusableSessionGetters -Scope Script -Value $map
+    }
+    return $map
+}
+
+function Set-UnusableSessionGetter {
+    param([Parameter(Mandatory)][string] $Command, [Parameter(Mandatory)][string] $Reason)
+    $map = Get-UnusableSessionGetterMap
+    if (-not $map.ContainsKey($Command)) {
+        $map[$Command] = [pscustomobject]@{ Reason = $Reason; Logged = $false }
+    }
+}
+
+function Test-UnusableSessionGetter {
+    param([Parameter(Mandatory)][string] $Command)
+    return (Get-UnusableSessionGetterMap).ContainsKey($Command)
+}
+
+# Say it once per run. A polling loop must not reprint the same warning every pass.
+function Write-UnusableSessionGetterOnce {
+    param([Parameter(Mandatory)][string] $Command, [string] $Suffix = '')
+    if (-not (Test-UnusableSessionGetter $Command)) { return }
+    $entry = (Get-UnusableSessionGetterMap)[$Command]
+    if ($entry.Logged) { return }
+    Write-Log "  $(Format-ShortText $entry.Reason 300)$Suffix" WARN
+    $entry.Logged = $true
+}
+
 # Enumerate one session getter. Any failure is reported WITH the command name, so a
 # log never leaves an operator guessing which of forty getters refused.
 function Get-SessionsFromGetter {
     param([Parameter(Mandatory)][string] $Command)
+    if (Test-UnusableSessionGetter $Command) {
+        throw [System.NotSupportedException]::new((Get-UnusableSessionGetterMap)[$Command].Reason)
+    }
     try {
         return @(& $Command -ErrorAction Stop)
     } catch {
         if (Test-NoAllSessionsError $_) {
-            throw [System.NotSupportedException]::new("$Command refuses to enumerate without -Id/-Session on this build: $($_.Exception.Message)")
+            $reason = "$Command refuses to enumerate without -Id/-Session on this build: $($_.Exception.Message)"
+            Set-UnusableSessionGetter $Command $reason
+            throw [System.NotSupportedException]::new($reason)
         }
         throw "$Command failed: $($_.Exception.Message)"
     }
@@ -2019,7 +2064,8 @@ function Get-ActiveVeeamWork {
                     # when a configured family depends on it; otherwise there is nothing
                     # of that kind here, so record the gap by name and carry on.
                     if ($inUse) { throw }
-                    Write-Log "  $($_.Exception.Message); no configured family needs it, so it was not queried" WARN
+                    Set-UnusableSessionGetter $collector.Command "$($_.Exception.Message)"
+                    Write-UnusableSessionGetterOnce $collector.Command '; no configured family needs it, so it was not queried'
                     continue
                 }
                 $active += @(Get-ActiveLabelsFromSessions -Sessions $sessions -Prefix $collector.Prefix -AssumeReturnedActive:([bool]$collector.Assume))
@@ -2046,7 +2092,8 @@ function Get-ActiveVeeamWork {
                 try {
                     $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VBR:$commandName" -AssumeReturnedActive)
                 } catch {
-                    Write-Log "  $(Format-ShortText $_.Exception.Message 300); it was not queried. The Explorer process barrier still applies." WARN
+                    Set-UnusableSessionGetter $commandName "$($_.Exception.Message)"
+                    Write-UnusableSessionGetterOnce $commandName '; it was not queried. The Explorer process barrier still applies.'
                 }
             }
         }

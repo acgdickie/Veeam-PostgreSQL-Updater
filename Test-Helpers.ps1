@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter','Format-ShortText',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter','Format-ShortText','Set-UnusableSessionGetter','Test-UnusableSessionGetter','Write-UnusableSessionGetterOnce','Get-UnusableSessionGetterMap',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1195,6 +1195,23 @@ Check 'other failure is NOT NotSupported' ($broken.Exception -is [System.NotSupp
 Check 'other failure names the command'  ($broken.Exception.Message -match 'Get-FakeBrokenGetter') 'True'
 Check 'other failure keeps the reason'   ($broken.Exception.Message -match 'server is on fire') 'True'
 Check 'working getter returns sessions'  (@(Get-SessionsFromGetter 'Get-FakeWorkingGetter').Count) 2
+# A refused getter must be remembered, so a polling install run does not pay for it
+# every pass, and must be warned about only once.
+$script:UnusableSessionGetters = @{}
+$script:FakeRefuseCalls = 0
+function Get-FakeCountingRefuser { [CmdletBinding()] param() $script:FakeRefuseCalls++; throw 'Specify either -Id or -Session parameter' }
+for ($i = 1; $i -le 3; $i++) { try { Get-SessionsFromGetter 'Get-FakeCountingRefuser' } catch {} }
+Check 'refused getter called once only' $script:FakeRefuseCalls 1
+Check 'refused getter is remembered'    (Test-UnusableSessionGetter 'Get-FakeCountingRefuser') 'True'
+$warned = 0
+function Write-Log { param($Message, $Level) if ("$Level" -eq 'WARN') { $script:warned++ } }
+Write-UnusableSessionGetterOnce 'Get-FakeCountingRefuser' ' suffix'
+Write-UnusableSessionGetterOnce 'Get-FakeCountingRefuser' ' suffix'
+Write-UnusableSessionGetterOnce 'Get-FakeCountingRefuser' ' suffix'
+Check 'warned exactly once'             $warned 1
+function Write-Log { param($Message, $Level) }
+Check 'unknown getter warns not at all' (Write-UnusableSessionGetterOnce 'Get-NeverSeenGetter') ''
+$script:UnusableSessionGetters = @{}
 Check 'refusal matcher: Veeam wording'   (Test-NoAllSessionsError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Specify either -Id or -Session parameter' } })) 'True'
 Check 'refusal matcher: unrelated text'  (Test-NoAllSessionsError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Access is denied' } })) 'False'
 # A multi-kilobyte Veeam dependency error must not swamp the one-line RMM summary.
