@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter','Format-ShortText','Set-UnusableSessionGetter','Test-UnusableSessionGetter','Write-UnusableSessionGetterOnce','Get-UnusableSessionGetterMap',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter','Format-ShortText','Set-UnusableSessionGetter','Test-UnusableSessionGetter','Write-UnusableSessionGetterOnce','Get-UnusableSessionGetterMap','Get-VeeamServiceStartOrder',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1156,6 +1156,46 @@ try {
         Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+'--- Get-VeeamServiceStartOrder (real VBR 13.0.1 dependency data) ---'
+# Deliberately listed in the alphabetical order Get-Service returns, which puts two
+# dependents BEFORE the service they need.
+$vbrSnapshot = @(
+    [pscustomobject]@{ Name='VeeamAHVSvc';           DependsOn=@('RpcSs','Winmgmt') }
+    [pscustomobject]@{ Name='VeeamBackupCdpSvc';     DependsOn=@('RpcSs','VeeamBackupSvc') }
+    [pscustomobject]@{ Name='VeeamBackupRESTSvc';    DependsOn=@('Winmgmt','RpcSs','VeeamBackupSvc') }
+    [pscustomobject]@{ Name='VeeamBackupSvc';        DependsOn=@('RpcSs','Winmgmt') }
+    [pscustomobject]@{ Name='VeeamBrokerSvc';        DependsOn=@('RpcSs','VeeamBackupSvc') }
+    [pscustomobject]@{ Name='VeeamCloudSvc';         DependsOn=@('RpcSs','VeeamBackupSvc') }
+    [pscustomobject]@{ Name='VeeamDataAnalyzerSvc';  DependsOn=@('RpcSs','VeeamBackupSvc') }
+    [pscustomobject]@{ Name='VeeamGCPSvc';           DependsOn=@() }
+    [pscustomobject]@{ Name='VeeamTransportSvc';     DependsOn=@('RpcSs','Winmgmt') }
+    [pscustomobject]@{ Name='VeeamWebSvc';           DependsOn=@('VeeamBackupRESTSvc','RpcSs','VeeamBackupSvc') }
+)
+$order = @(Get-VeeamServiceStartOrder $vbrSnapshot | ForEach-Object { $_.Name })
+function IndexOfName($list, $name) { [array]::IndexOf($list, $name) }
+Check 'every service is returned once'   $order.Count 10
+Check 'no service is lost'               (@($order | Sort-Object -Unique).Count) 10
+Check 'BackupSvc before CdpSvc'          ((IndexOfName $order 'VeeamBackupSvc') -lt (IndexOfName $order 'VeeamBackupCdpSvc')) 'True'
+Check 'BackupSvc before RESTSvc'         ((IndexOfName $order 'VeeamBackupSvc') -lt (IndexOfName $order 'VeeamBackupRESTSvc')) 'True'
+Check 'BackupSvc before BrokerSvc'       ((IndexOfName $order 'VeeamBackupSvc') -lt (IndexOfName $order 'VeeamBrokerSvc')) 'True'
+Check 'BackupSvc before CloudSvc'        ((IndexOfName $order 'VeeamBackupSvc') -lt (IndexOfName $order 'VeeamCloudSvc')) 'True'
+Check 'BackupSvc before DataAnalyzer'    ((IndexOfName $order 'VeeamBackupSvc') -lt (IndexOfName $order 'VeeamDataAnalyzerSvc')) 'True'
+Check 'RESTSvc before WebSvc'            ((IndexOfName $order 'VeeamBackupRESTSvc') -lt (IndexOfName $order 'VeeamWebSvc')) 'True'
+Check 'independent ones keep order'      ((IndexOfName $order 'VeeamAHVSvc') -lt (IndexOfName $order 'VeeamTransportSvc')) 'True'
+Check 'Windows-only deps are ignored'    ((IndexOfName $order 'VeeamAHVSvc') -eq 0) 'True'
+# A dependency cycle must not drop services or loop forever.
+$cycle = @(
+    [pscustomobject]@{ Name='A'; DependsOn=@('B') }
+    [pscustomobject]@{ Name='B'; DependsOn=@('A') }
+    [pscustomobject]@{ Name='C'; DependsOn=@() }
+)
+$cycleOrder = @(Get-VeeamServiceStartOrder $cycle | ForEach-Object { $_.Name })
+Check 'cycle keeps every service'        $cycleOrder.Count 3
+Check 'cycle puts the free one first'    $cycleOrder[0] 'C'
+# A missing DependsOn property (an older recovery file) must not throw.
+Check 'missing DependsOn tolerated'      (@(Get-VeeamServiceStartOrder @([pscustomobject]@{ Name='X' })).Count) 1
+Check 'empty snapshot tolerated'         (@(Get-VeeamServiceStartOrder @()).Count) 0
 
 '--- Installer resolution prefers the file host over the download page ---'
 Check 'direct probe exists'              ($scriptText -match 'function Resolve-PgInstallerDirectUrl') 'True'

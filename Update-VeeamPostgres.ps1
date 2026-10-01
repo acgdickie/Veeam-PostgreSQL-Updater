@@ -515,12 +515,19 @@ function Get-VeeamServiceState {
         if ("$($svc.Status)" -notin @('Running','Stopped')) {
             throw "Service $($svc.Name) is $($svc.Status); wait for it to become Running or Stopped before updating"
         }
+        # Windows itself records the order: on VBR 13.0.1, VeeamBackupSvc depends on
+        # nothing Veeam, five services depend on it, and VeeamWebSvc additionally
+        # depends on VeeamBackupRESTSvc. Capture that instead of hardcoding a list,
+        # so each build and product mix is started in its own correct order.
+        $dependsOn = @()
+        try { $dependsOn = @($svc.ServicesDependedOn | ForEach-Object { "$($_.Name)" } | Where-Object { $_ }) } catch {}
         $result += [pscustomobject]@{
             Name        = $svc.Name
             DisplayName = $svc.DisplayName
             Status      = "$($svc.Status)"
             WasRunning  = ($svc.Status -eq 'Running')
             StartupType = Get-ServiceStartupTypeExact $svc.Name
+            DependsOn   = $dependsOn
         }
     }
     return $result
@@ -535,6 +542,42 @@ function Disable-VeeamServiceStartup {
         } catch { $problems += "$($rec.Name): $($_.Exception.Message)" }
     }
     return $problems
+}
+
+# Order the services to start so that each one's Veeam dependencies go first.
+# Dependencies come from Windows itself (ServicesDependedOn), captured per server.
+# Services with no Veeam dependency keep their original relative order, so the
+# result is stable. Anything left in a cycle, or depending on something outside
+# the snapshot, is returned last rather than dropped.
+function Get-VeeamServiceStartOrder {
+    param([Parameter(Mandatory)] $Services)
+    $records = @($Services)
+    $names = @($records | ForEach-Object { "$($_.Name)" })
+    $ordered = @()
+    $startedNames = @{}
+    $remaining = @($records)
+
+    while ($remaining.Count -gt 0) {
+        $ready = @()
+        foreach ($rec in $remaining) {
+            $deps = @()
+            try { $deps = @($rec.DependsOn | Where-Object { $_ }) } catch {}
+            # Only dependencies that are themselves in this snapshot can be waited
+            # for. Windows handles RpcSs, Winmgmt and friends on its own.
+            $veeamDeps = @($deps | Where-Object { $names -contains "$_" -and -not $startedNames.ContainsKey("$_") })
+            if ($veeamDeps.Count -eq 0) { $ready += $rec }
+        }
+        if ($ready.Count -eq 0) {
+            # A cycle or an unresolvable dependency. Append the rest unchanged.
+            $ordered += $remaining
+            break
+        }
+        foreach ($rec in $ready) { $startedNames["$($rec.Name)"] = $true }
+        $ordered += $ready
+        $readyNames = @($ready | ForEach-Object { "$($_.Name)" })
+        $remaining = @($remaining | Where-Object { $readyNames -notcontains "$($_.Name)" })
+    }
+    return $ordered
 }
 
 function Restore-VeeamServiceState {
@@ -552,7 +595,7 @@ function Restore-VeeamServiceState {
         } catch { $problems += "$($rec.Name) startup type: $($_.Exception.Message)" }
     }
 
-    foreach ($rec in @($script:VeeamServices)) {
+    foreach ($rec in @(Get-VeeamServiceStartOrder $script:VeeamServices)) {
         try {
             $svc = Get-Service -Name $rec.Name -ErrorAction Stop
             if ($rec.WasRunning) {
