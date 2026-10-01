@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -51,6 +51,12 @@ Check 'TargetVersion parameter removed' ($scriptParameterNames -contains 'Target
 Check 'ConfigPath parameter removed'    ($scriptParameterNames -contains 'ConfigPath')    'False'
 Check 'Install parameter remains'       ($scriptParameterNames -contains 'Install')       'True'
 Check 'Recover parameter exposed'       ($scriptParameterNames -contains 'Recover')       'True'
+Check 'stale EM removal switch exposed' ($scriptParameterNames -contains 'RemoveStaleEnterpriseManagerRecord') 'True'
+# A leftover registry key alone must never count as an installed Enterprise Manager.
+$scriptText = Get-Content -LiteralPath $script:Path -Raw
+Check 'EM needs service or files'       ($scriptText -match 'emServices\.Count -gt 0 -or \$emPaths\.Count -gt 0') 'True'
+Check 'stale EM key is not a product'   ($scriptText -match 'StaleEnterpriseManagerKey = \$emKey') 'True'
+Check 'EM removal needs proven stale'   ($scriptText -match 'if \(-not \$script:StaleEnterpriseManagerKey\)') 'True'
 $workRootParameter = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'WorkRoot' })[0]
 Check 'WorkRoot default is C:\ProgramData\VeeamPgUpdate' $workRootParameter.DefaultValue.Value 'C:\ProgramData\VeeamPgUpdate'
 $legacyFunction = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-TrustedLegacyRecoveryMarker' }, $true))[0]
@@ -1149,6 +1155,28 @@ try {
         Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+'--- Remove-StaleVeeamRegistryRecord (throwaway HKCU key, never a real Veeam key) ---'
+$testKeyPath = "HKCU:\Software\VpguStaleRecordTest-$PID"
+$testBackup  = Join-Path $env:TEMP "vpgu-stale-record-$PID.reg"
+try {
+    New-Item -Path $testKeyPath -Force | Out-Null
+    New-ItemProperty -Path $testKeyPath -Name 'CorePath' -Value 'C:\nowhere' -PropertyType String -Force | Out-Null
+    $returned = Remove-StaleVeeamRegistryRecord -Key $testKeyPath -BackupPath $testBackup
+    Check 'key is removed'                (Test-Path -LiteralPath $testKeyPath) 'False'
+    Check 'backup path returned'           ($returned -eq $testBackup) 'True'
+    Check 'backup file exists'             (Test-Path -LiteralPath $testBackup) 'True'
+    Check 'backup holds the value'         ((Get-Content -LiteralPath $testBackup -Raw) -match 'CorePath') 'True'
+    Check 'missing key throws'             (Throws { Remove-StaleVeeamRegistryRecord -Key $testKeyPath -BackupPath $testBackup }) 'True'
+    Check 'unsupported hive throws'        (Throws { Remove-StaleVeeamRegistryRecord -Key 'HKLM:\SOFTWARE' -BackupPath 'X:\no\such\path\x.reg' }) 'True'
+    # An unwritable backup path must stop the deletion, not proceed without a backup.
+    New-Item -Path $testKeyPath -Force | Out-Null
+    Check 'no backup means no delete'      (Throws { Remove-StaleVeeamRegistryRecord -Key $testKeyPath -BackupPath 'X:\no\such\path\x.reg' }) 'True'
+    Check 'key survives a failed backup'   (Test-Path -LiteralPath $testKeyPath) 'True'
+} finally {
+    Remove-Item -LiteralPath $testKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $testBackup -Force -ErrorAction SilentlyContinue
 }
 
 '--- Get-CfgValue StrictMode safety ---'

@@ -48,6 +48,15 @@
     The folder and its parent must pass ownership, ACL and reparse-point checks.
     Logs are written here only after those checks pass, and pruned after retentionDays.
 
+.PARAMETER RemoveStaleEnterpriseManagerRecord
+    Delete the leftover HKLM\SOFTWARE\Veeam\Veeam Backup Reporting registry key when
+    this run has PROVEN Enterprise Manager is not installed (no service and no
+    installed files). A .reg backup is exported into the log folder first, and the
+    key is removed only after that backup is verified. If Enterprise Manager really
+    is installed, or no leftover key was found, nothing is removed.
+    This touches the registry only. It does not change the Veeam configuration
+    database, so it does not clear a VBR-side Enterprise Manager connection record.
+
 .PARAMETER SkipDownloadInAudit
     Audit mode normally checks the EnterpriseDB download page for the exact
     Windows x64 installer. This skips that check. The audit still contacts
@@ -86,7 +95,8 @@ param(
     [switch] $Reboot,
     [switch] $Recover,
     [string] $WorkRoot = 'C:\ProgramData\VeeamPgUpdate',
-    [switch] $SkipDownloadInAudit
+    [switch] $SkipDownloadInAudit,
+    [switch] $RemoveStaleEnterpriseManagerRecord
 )
 
 $ErrorActionPreference = 'Stop'
@@ -195,6 +205,7 @@ $script:NatsWasRunning = $false
 $script:NatsStartupType = $null
 $script:PgServiceName = $null
 $script:PgStartupType = $null
+$script:StaleEnterpriseManagerKey = $null
 $script:Vb365MaintenanceSessionId = $null
 $script:Vb365MaintenancePending = $false
 $script:RecoveryState = $null
@@ -208,6 +219,7 @@ $script:Report       = [ordered]@{
     PgInstalled    = ''
     PgTarget       = ''
     PgEol          = $false
+    StaleEmRecord  = ''
     Stage          = 'UNTOUCHED'
     Outcome        = 'UNKNOWN'
     ExitCode       = $null
@@ -464,6 +476,26 @@ function Test-PathTreeOverlap {
     if ($leftFull -ieq $rightFull) { return $true }
     return $leftFull.StartsWith("$rightFull\", [StringComparison]::OrdinalIgnoreCase) -or
            $rightFull.StartsWith("$leftFull\", [StringComparison]::OrdinalIgnoreCase)
+}
+
+# Export a .reg backup, verify it, then delete the key. Callers must already have
+# proven the record is stale; this helper only refuses to delete without a backup.
+function Remove-StaleVeeamRegistryRecord {
+    param(
+        [Parameter(Mandatory)][string] $Key,
+        [Parameter(Mandatory)][string] $BackupPath
+    )
+    if (-not (Test-Path -LiteralPath $Key)) { throw "$Key does not exist" }
+    $nativeKey = $Key -replace '^HKLM:\\', 'HKEY_LOCAL_MACHINE\' -replace '^HKCU:\\', 'HKEY_CURRENT_USER\'
+    if ($nativeKey -notmatch '^HKEY_(LOCAL_MACHINE|CURRENT_USER)\\.+') { throw "unsupported registry path: $Key" }
+    if (Test-Path -LiteralPath $BackupPath) { Remove-Item -LiteralPath $BackupPath -Force -ErrorAction Stop }
+    $export = Invoke-Native (Join-Path $env:SystemRoot 'System32\reg.exe') @('export', $nativeKey, $BackupPath, '/y')
+    if ($export.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $BackupPath) -or (Get-Item -LiteralPath $BackupPath).Length -eq 0) {
+        throw "could not export a verified .reg backup to $BackupPath (exit $($export.ExitCode)) $($export.StdErr)"
+    }
+    Remove-Item -LiteralPath $Key -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $Key) { throw "$Key still exists after the removal request" }
+    return $BackupPath
 }
 
 function Get-VeeamServiceState {
@@ -2524,9 +2556,50 @@ if (Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam ONE') {
 }
 
 # --- Enterprise Manager (has its own PostgreSQL-capable configuration DB) ---
-if (Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam Backup Reporting') {
-    $products += [pscustomobject]@{ Name='EnterpriseManager'; Version=$null; CorePath=$null }
-    Write-Log 'Found Veeam Backup Enterprise Manager; this topology is excluded until its separate configuration database is supported' WARN
+# An uninstall can leave HKLM\SOFTWARE\Veeam\Veeam Backup Reporting behind, so the
+# key alone is not proof. Require a service or installed files as corroboration,
+# exactly as VB365 requires more than a leftover directory. Treating a stale key
+# as an installation would exclude a server that has no Enterprise Manager at all.
+$emKey = 'HKLM:\SOFTWARE\Veeam\Veeam Backup Reporting'
+if (Test-Path $emKey) {
+    $emServices = @(Get-Service -Name 'Veeam*' -ErrorAction SilentlyContinue |
+        Where-Object { "$($_.Name) $($_.DisplayName)" -match 'EnterpriseManager|Enterprise Manager' })
+    $emPaths = @()
+    foreach ($emValueName in @('CorePath','InstallPath','Path','WebPath')) {
+        $emCandidate = Get-RegValue $emKey $emValueName
+        if ($emCandidate -and (Test-Path -LiteralPath "$emCandidate")) { $emPaths += "$emCandidate" }
+    }
+    $emDefaultPath = 'C:\Program Files\Veeam\Backup and Replication\Enterprise Manager'
+    if (Test-Path -LiteralPath $emDefaultPath) { $emPaths += $emDefaultPath }
+
+    if ($emServices.Count -gt 0 -or $emPaths.Count -gt 0) {
+        $products += [pscustomobject]@{ Name='EnterpriseManager'; Version=$null; CorePath=$(if ($emPaths.Count -gt 0) { $emPaths[0] } else { $null }) }
+        $emEvidence = @()
+        if ($emServices.Count -gt 0) { $emEvidence += "service(s): $(@($emServices | ForEach-Object { $_.Name }) -join ', ')" }
+        if ($emPaths.Count -gt 0)    { $emEvidence += "path(s): $(@($emPaths | Select-Object -Unique) -join ', ')" }
+        Write-Log "Found Veeam Backup Enterprise Manager ($($emEvidence -join '; ')); this topology is excluded until its separate configuration database is supported" WARN
+    } else {
+        $script:StaleEnterpriseManagerKey = $emKey
+        $script:Report.StaleEmRecord = 'present'
+        Write-Log "$emKey exists but Enterprise Manager has no service and no installed files. Treating it as a leftover record from an uninstall, not an installation." WARN
+        Write-Log '  To clear the leftover record, rerun this script once with -RemoveStaleEnterpriseManagerRecord. It exports a .reg backup into the log folder first.' WARN
+    }
+}
+
+if ($RemoveStaleEnterpriseManagerRecord) {
+    if (-not $script:StaleEnterpriseManagerKey) {
+        Write-Log '-RemoveStaleEnterpriseManagerRecord was passed, but this run did not prove a leftover Enterprise Manager record. Nothing was removed.' WARN
+    } else {
+        $emBackup = Join-Path $script:LogDir "stale-enterprise-manager-record-$($script:Stamp).reg"
+        try {
+            [void](Remove-StaleVeeamRegistryRecord -Key $script:StaleEnterpriseManagerKey -BackupPath $emBackup)
+        } catch {
+            Complete-Run $EXIT.PREFLIGHT 'STALE_EM_RECORD_REMOVE_FAILED' "Could not remove the leftover Enterprise Manager registry record $($script:StaleEnterpriseManagerKey): $($_.Exception.Message)"
+        }
+        Write-Log "Removed the leftover record $($script:StaleEnterpriseManagerKey). Backup: $emBackup" OK
+        $script:Report.StaleEmRecord = "removed; backup $emBackup"
+        $script:StaleEnterpriseManagerKey = $null
+    }
 }
 
 $script:Report.VeeamProducts = ($products | ForEach-Object { $_.Name }) -join '+'

@@ -45,6 +45,7 @@ Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 | File | What it is |
 |---|---|
 | `Update-VeeamPostgres.ps1` | The script. **The only file your RMM needs** |
+| `Clear-StaleEnterpriseManagerRecord.ps1` | One-off tool. Reports, and can clear, a leftover Enterprise Manager record inside the VBR database |
 | `Test-Helpers.ps1` | Unit tests. Run after any edit |
 
 The settings are built into the script, so an RMM that uploads just the one file to a
@@ -137,6 +138,7 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | `-Recover` | off | Validate and restore captured state from an interrupted pre-installer run; post-installer use is diagnostic-only |
 | `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
 | `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed |
+| `-RemoveStaleEnterpriseManagerRecord` | off | Delete a proven-stale `Veeam Backup Reporting` registry key, after exporting and verifying a `.reg` backup |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
 RMM script or policy. The independent RMM owns the maintenance window, retries, reboot,
@@ -481,6 +483,38 @@ If rollback/state restoration succeeds but the completed marker cannot be remove
 result is exit `40`, `Stage=COMPLETE`, and `IssueCode=MARKER_REMOVE_FAILED`. Jobs are not
 reported as disabled when their durable records say they were restored. Confirm the
 completed state, then remove the stale marker under the operator change record.
+
+## Leftover Enterprise Manager records
+
+Enterprise Manager has its own configuration database, which this script does not yet
+discover or protect, so a server with Enterprise Manager **installed** is excluded
+(`ENTERPRISE_MANAGER_PRESENT`, exit 11).
+
+An uninstall can leave records behind, and then the server is excluded for a product that
+is not there. There are two separate records:
+
+| Record | Where | How to clear it |
+|---|---|---|
+| Install footprint | Registry `HKLM\SOFTWARE\Veeam\Veeam Backup Reporting` | `Update-VeeamPostgres.ps1 -RemoveStaleEnterpriseManagerRecord` |
+| Connection record | Inside the VBR configuration database | `Clear-StaleEnterpriseManagerRecord.ps1 -Clear` |
+
+The registry key alone never counts as an installation. The script also needs an Enterprise
+Manager **service** or its **installed files**. With only the key, the run continues and
+logs that it found a leftover record.
+
+`-RemoveStaleEnterpriseManagerRecord` deletes that key only when the same run proved
+Enterprise Manager is absent. It exports a `.reg` backup into the log folder and verifies it
+first; no backup means no deletion. It never touches the Veeam configuration database.
+
+`Clear-StaleEnterpriseManagerRecord.ps1` covers the record inside the VBR database. It
+**reports only** unless you pass `-Clear`, and `-Clear` refuses unless Enterprise Manager is
+absent and a successful VBR configuration backup exists from the last 24 hours.
+
+> **The clear uses an unsupported API.** `[Veeam.Backup.Core.SBackupOptions]` is an internal
+> Veeam class with no public documentation, and it writes directly to the VBR configuration
+> database. Veeam Support does not support this and the class can change between versions.
+> The supported route is to remove this VBR server from the Enterprise Manager console, or
+> to ask Veeam Support. Test on a non-production VBR first.
 
 ## Known limits
 
