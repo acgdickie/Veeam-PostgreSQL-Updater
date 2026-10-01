@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter','Format-ShortText','Set-UnusableSessionGetter','Test-UnusableSessionGetter','Write-UnusableSessionGetterOnce','Get-UnusableSessionGetterMap','Get-VeeamServiceStartOrder',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Test-VbrConnectionLostError','Get-SessionsFromGetter','Format-ShortText','Set-UnusableSessionGetter','Test-UnusableSessionGetter','Write-UnusableSessionGetterOnce','Get-UnusableSessionGetterMap','Get-VeeamServiceStartOrder',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1161,6 +1161,20 @@ try {
         Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+'--- Reconnecting VBR after its service restarts ---'
+# The VBR module keeps a live connection to the Veeam Backup Service. Restarting that
+# service killed it on VBR-01, and the final activity check then failed, leaving all
+# four schedules disabled. Exit code 40, PostgreSQL already correctly on 15.19.
+Check 'VBR reconnect: disconnect first'  ($scriptText -match 'Disconnect-VBRServer -ErrorAction Stop') 'True'
+Check 'VBR reconnect: connect local'    ($scriptText -match 'Connect-VBRServer -Server localhost -ErrorAction Stop') 'True'
+Check 'missing Connect-VBRServer fails' ($scriptText -match 'Connect-VBRServer is unavailable, so the VBR connection cannot be re-established') 'True'
+Check 'post-start reconnects both'      ($scriptText -match 'Connect-VeeamModules -Vbr:\$hasVbr -Vb365:\$hasVb365 -Quiet -Reconnect\)') 'True'
+Check 'recovery reconnects both'        ($scriptText -match 'Connect-VeeamModules -Vbr:\$hasVbr -Vb365:\$hasVb365 -Reconnect\)') 'True'
+Check 'no VB365-only reconnect left'    ($scriptText -match 'Connect-VeeamModules .*-Reconnect:\$hasVb365') 'False'
+Check 'lost-connection matcher: Veeam'  (Test-VbrConnectionLostError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Remote connection was terminated. Either re-establish remote connection or use local one, ex. Connect-VBRServer -Server localhost' } })) 'True'
+Check 'lost-connection matcher: other'  (Test-VbrConnectionLostError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Access is denied' } })) 'False'
+Check 'retry is bounded at 3'           ($scriptText -match 'if \(\$tries -lt 3\)') 'True'
 
 '--- Patience for VBR 13 slow service starts ---'
 Check 'settle window is 10 minutes'     ($scriptText -match '\$script:ServiceSettleMinutes = 10') 'True'

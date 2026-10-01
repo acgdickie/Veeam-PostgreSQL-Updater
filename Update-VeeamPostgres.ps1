@@ -1395,6 +1395,22 @@ function Connect-VeeamModules {
     if ($Vbr) {
         try { Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue }
         catch { $failed += "Veeam.Backup.PowerShell (use the PowerShell version required by the installed VBR build): $($_.Exception.Message)" }
+        # The VBR module holds a live connection to the Veeam Backup Service. Restarting
+        # that service kills it, and every later cmdlet then fails with "Remote
+        # connection was terminated. Either re-establish remote connection or use local
+        # one, ex. Connect-VBRServer -Server localhost". Reconnect explicitly after any
+        # service restart, or the final activity check fails and schedules stay off.
+        if ($Reconnect -and $failed.Count -eq 0) {
+            if (Get-Command Disconnect-VBRServer -ErrorAction SilentlyContinue) {
+                try { Disconnect-VBRServer -ErrorAction Stop | Out-Null } catch {}
+            }
+            if (Get-Command Connect-VBRServer -ErrorAction SilentlyContinue) {
+                try { Connect-VBRServer -Server localhost -ErrorAction Stop | Out-Null }
+                catch { $failed += "Connect-VBRServer -Server localhost failed: $($_.Exception.Message)" }
+            } else {
+                $failed += 'Connect-VBRServer is unavailable, so the VBR connection cannot be re-established after the service restart'
+            }
+        }
     }
     if ($Vb365) {
         $vboModule = 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
@@ -1989,6 +2005,18 @@ function Test-NoAllSessionsError {
     return ($message -match 'Specify\s+either\b.*\b(Id|Session)\b')
 }
 
+# Restarting the Veeam Backup Service kills the module's connection. Veeam says so
+# in the error itself: "Remote connection was terminated. Either re-establish remote
+# connection or use local one, ex. Connect-VBRServer -Server localhost".
+function Test-VbrConnectionLostError {
+    param([Parameter(Mandatory)] $ErrorRecord)
+    $message = ''
+    try { $message = "$($ErrorRecord.Exception.Message)" } catch {}
+    return ($message -match 'Remote connection was terminated' -or
+            $message -match 're-establish remote connection' -or
+            $message -match 'Connect-VBRServer')
+}
+
 # Getters proven unusable on this build, so the idle check does not pay for them
 # again. The install path polls this check repeatedly while waiting for Veeam work
 # to finish, and on a VBR 13.0.1 server the dead getters cost ~90 seconds a poll.
@@ -2043,6 +2071,22 @@ function Get-SessionsFromGetter {
             $reason = "$Command refuses to enumerate without -Id/-Session on this build: $($_.Exception.Message)"
             Set-UnusableSessionGetter $Command $reason
             throw [System.NotSupportedException]::new($reason)
+        }
+        # A dropped VBR connection is recoverable: reconnect and ask once more. Bound
+        # the attempts per run so a genuinely broken service cannot loop.
+        if (Test-VbrConnectionLostError $_) {
+            $tries = Get-Variable -Name VbrReconnectAttempts -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+            if ($null -eq $tries) { $tries = 0 }
+            if ($tries -lt 3) {
+                Set-Variable -Name VbrReconnectAttempts -Scope Script -Value ($tries + 1)
+                Write-Log "  $Command lost its VBR connection; re-establishing it and retrying (attempt $($tries + 1)/3)" WARN
+                $reconnectProblems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+                if ($reconnectProblems.Count -gt 0) {
+                    throw "$Command failed and the VBR connection could not be re-established: $($reconnectProblems -join ' | ')"
+                }
+                try { return @(& $Command -ErrorAction Stop) }
+                catch { throw "$Command failed again after re-establishing the VBR connection: $($_.Exception.Message)" }
+            }
         }
         throw "$Command failed: $($_.Exception.Message)"
     }
@@ -2537,7 +2581,8 @@ function Invoke-ExplicitRecovery {
     if ($problems.Count -eq 0) {
         $hasVbr = "$($state.Products)" -match '(^|\+)VBR($|\+)'
         $hasVb365 = "$($state.Products)" -match '(^|\+)VB365($|\+)'
-        $moduleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Reconnect:$hasVb365)
+        # Services were just restarted here, so VBR needs reconnecting too, not only VB365.
+        $moduleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Reconnect)
         if ($moduleProblems.Count -gt 0) { $problems += $moduleProblems }
         else {
             try {
@@ -4583,7 +4628,7 @@ if ($hasVbr) {
 # The VB365 controller connection does not survive its service restart. Reconnect
 # before releasing repository maintenance or touching schedules. VBR is imported
 # again as a harmless health check of its local module surface.
-$postStartModuleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Quiet -Reconnect:$hasVb365)
+$postStartModuleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Quiet -Reconnect)
 if ($postStartModuleProblems.Count -gt 0) { $notRunning += @($postStartModuleProblems) }
 if ($notRunning.Count -eq 0 -and $pgFinalProblems.Count -eq 0) {
     Write-Log 'All Veeam service startup types and running states were restored' OK
