@@ -1157,6 +1157,15 @@ try {
     }
 }
 
+'--- Installer resolution prefers the file host over the download page ---'
+Check 'direct probe exists'              ($scriptText -match 'function Resolve-PgInstallerDirectUrl') 'True'
+Check 'direct probe tried first'         ($scriptText -match '\$direct = Resolve-PgInstallerDirectUrl \$Version\s*\r?\n\s*if \(\$direct\) \{ return \$direct \}') 'True'
+Check 'build suffix is probed, not fixed' ($scriptText -match 'foreach \(\$suffix in 5, 4, 3, 2, 1\)') 'True'
+Check 'only HTTP 200 counts as found'    ($scriptText -match 'if \(\$head\.StatusCode -ne 200\) \{ continue \}') 'True'
+Check 'page scrape retries'              ($scriptText -match 'EnterpriseDB page attempt \$attempt/3 failed') 'True'
+Check 'page scrape sends a user agent'   ($scriptText -match '-UserAgent \$userAgent') 'True'
+Check 'host allowlist still enforced'    ($scriptText -match "notin @\('sbp\.enterprisedb\.com','get\.enterprisedb\.com','www\.enterprisedb\.com'\)") 'True'
+
 '--- Test-CommandCallableBare (what broke the VBR 13.0.1 idle check) ---'
 # Shaped like Get-VBRSession: every parameter set demands something.
 function Get-FakeSessionNeedsId {

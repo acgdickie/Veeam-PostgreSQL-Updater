@@ -3543,10 +3543,60 @@ function Resolve-PgInstallerLinkFromHtml {
     return $uri.AbsoluteUri
 }
 
+# The download page sits behind a CDN that intermittently answers 403 to a script:
+# a VBR 13.0.1 install run was refused minutes after an audit on the same server
+# succeeded. The file host itself does not do that, and its naming is exact, so
+# probe it directly first and keep the page scrape only as a fallback.
+#
+# The build suffix is NOT derivable and does change: 15.19 was published as -3- on
+# 2026-09-16 and as -4- on 2026-10-01. Probe high to low and take the first hit. A
+# missing object answers 403 from the CDN, so only an explicit 200 counts as found.
+function Resolve-PgInstallerDirectUrl {
+    param([Parameter(Mandatory)][string] $Version)
+    foreach ($suffix in 5, 4, 3, 2, 1) {
+        $url = "https://get.enterprisedb.com/postgresql/postgresql-$Version-$suffix-windows-x64.exe"
+        try {
+            $head = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            if ($head.StatusCode -ne 200) { continue }
+            $len = 0
+            try {
+                $cl = $head.Headers['Content-Length']
+                if ($cl -is [array]) { $cl = $cl[0] }
+                if ($cl) { $len = [int64]$cl }
+            } catch {}
+            Write-Log ("EnterpriseDB file host publishes build -{0}- for {1} ({2:N0} bytes)" -f $suffix, $Version, $len) OK
+            return [pscustomobject]@{ PageUrl='(direct file host, no page scrape)'; Url=$url; ResolvedUrl=$url; Length=$len }
+        } catch {
+            Write-Log "  build -$suffix- for $Version is not published on the file host"
+        }
+    }
+    return $null
+}
+
 function Resolve-PgInstallerUrl {
     param([Parameter(Mandatory)][string] $Version)
+
+    $direct = Resolve-PgInstallerDirectUrl $Version
+    if ($direct) { return $direct }
+    Write-Log "The EnterpriseDB file host published no build for $Version; falling back to the download page" WARN
+
     $pageUrl = 'https://www.enterprisedb.com/downloads/postgres-postgresql-downloads'
-    $page = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+    # A browser user agent and a couple of retries, because the refusal is transient.
+    $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+    $page = $null
+    $pageError = $null
+    foreach ($attempt in 1, 2, 3) {
+        try {
+            $page = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -TimeoutSec 60 -UserAgent $userAgent -ErrorAction Stop
+            break
+        } catch {
+            $pageError = $_.Exception.Message
+            Write-Log "  EnterpriseDB page attempt $attempt/3 failed: $(Format-ShortText $pageError 200)" WARN
+            if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+        }
+    }
+    if (-not $page) { throw "the EnterpriseDB download page could not be read after 3 attempts: $pageError" }
+
     $publishedUrl = Resolve-PgInstallerLinkFromHtml -Html $page.Content -Version $Version
     if (-not $publishedUrl) { return $null }
 
