@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1156,6 +1156,50 @@ try {
         Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+'--- Get-VeeamRegistryPostgresDatabase (throwaway HKCU keys, Veeam KB1471 layout) ---'
+$dbKeyRoot = "HKCU:\Software\VpguDbLayoutTest-$PID"
+try {
+    # A PostgreSQL product, exactly as KB1471 documents it.
+    $pgProduct = "$dbKeyRoot\PgProduct"
+    New-Item -Path "$pgProduct\DatabaseConfigurations\PostgreSql" -Force | Out-Null
+    New-ItemProperty -Path "$pgProduct\DatabaseConfigurations" -Name 'SqlActiveConfiguration' -Value 'PostgreSql' -Force | Out-Null
+    New-ItemProperty -Path "$pgProduct\DatabaseConfigurations\PostgreSql" -Name 'SqlHostName' -Value 'localhost' -Force | Out-Null
+    New-ItemProperty -Path "$pgProduct\DatabaseConfigurations\PostgreSql" -Name 'SqlHostPort' -Value '5432' -Force | Out-Null
+    New-ItemProperty -Path "$pgProduct\DatabaseConfigurations\PostgreSql" -Name 'SqlDatabaseName' -Value 'VeeamBackupReporting' -Force | Out-Null
+    $pgRead = Get-VeeamRegistryPostgresDatabase -ProductKey $pgProduct -Label 'EM test'
+    Check 'EM PostgreSQL read: kind'      $pgRead.Kind     'POSTGRES'
+    Check 'EM PostgreSQL read: host'      $pgRead.Host     'localhost'
+    Check 'EM PostgreSQL read: port'      $pgRead.Port     5432
+    Check 'EM PostgreSQL read: database'  $pgRead.Database 'VeeamBackupReporting'
+
+    # MS SQL: a real answer, not an error - the engine simply is not PostgreSQL.
+    $msProduct = "$dbKeyRoot\MsProduct"
+    New-Item -Path "$msProduct\DatabaseConfigurations" -Force | Out-Null
+    New-ItemProperty -Path "$msProduct\DatabaseConfigurations" -Name 'SqlActiveConfiguration' -Value 'MsSql' -Force | Out-Null
+    Check 'EM MS SQL read'                (Get-VeeamRegistryPostgresDatabase -ProductKey $msProduct -Label 'EM test').Kind 'MSSQL'
+
+    # Everything incomplete or unexpected must be UNKNOWN, never a guessed default.
+    Check 'no DatabaseConfigurations key'  (Get-VeeamRegistryPostgresDatabase -ProductKey "$dbKeyRoot\Missing" -Label 'EM test').Kind 'UNKNOWN'
+    $noEngine = "$dbKeyRoot\NoEngine"; New-Item -Path "$noEngine\DatabaseConfigurations" -Force | Out-Null
+    Check 'no SqlActiveConfiguration'      (Get-VeeamRegistryPostgresDatabase -ProductKey $noEngine -Label 'EM test').Kind 'UNKNOWN'
+    New-ItemProperty -Path "$noEngine\DatabaseConfigurations" -Name 'SqlActiveConfiguration' -Value 'Oracle' -Force | Out-Null
+    Check 'unexpected engine name'         (Get-VeeamRegistryPostgresDatabase -ProductKey $noEngine -Label 'EM test').Kind 'UNKNOWN'
+    $partial = "$dbKeyRoot\Partial"
+    New-Item -Path "$partial\DatabaseConfigurations\PostgreSql" -Force | Out-Null
+    New-ItemProperty -Path "$partial\DatabaseConfigurations" -Name 'SqlActiveConfiguration' -Value 'PostgreSql' -Force | Out-Null
+    New-ItemProperty -Path "$partial\DatabaseConfigurations\PostgreSql" -Name 'SqlHostName' -Value 'localhost' -Force | Out-Null
+    Check 'missing port and database'      (Get-VeeamRegistryPostgresDatabase -ProductKey $partial -Label 'EM test').Kind 'UNKNOWN'
+    New-ItemProperty -Path "$partial\DatabaseConfigurations\PostgreSql" -Name 'SqlHostPort' -Value 'notaport' -Force | Out-Null
+    New-ItemProperty -Path "$partial\DatabaseConfigurations\PostgreSql" -Name 'SqlDatabaseName' -Value 'db' -Force | Out-Null
+    Check 'non-numeric port'               (Get-VeeamRegistryPostgresDatabase -ProductKey $partial -Label 'EM test').Kind 'UNKNOWN'
+    Set-ItemProperty -Path "$partial\DatabaseConfigurations\PostgreSql" -Name 'SqlHostPort' -Value '70000'
+    Check 'out-of-range port'              (Get-VeeamRegistryPostgresDatabase -ProductKey $partial -Label 'EM test').Kind 'UNKNOWN'
+} finally {
+    Remove-Item -LiteralPath $dbKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Check 'EM supported only beside VBR'  ($scriptText -match "hasEnterpriseManager -and -not \`$hasVbr") 'True'
+Check 'EM database joins the dump set' ($scriptText -match "Product='EnterpriseManager'; Database=\`$emDb\.Database") 'True'
 
 '--- Remove-StaleVeeamRegistryRecord (throwaway HKCU key, never a real Veeam key) ---'
 $testKeyPath = "HKCU:\Software\VpguStaleRecordTest-$PID"

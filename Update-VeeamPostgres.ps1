@@ -2607,9 +2607,7 @@ $script:Report.VeeamProducts = ($products | ForEach-Object { $_.Name }) -join '+
 if (@($products | Where-Object { $_.Name -eq 'VeeamONE' }).Count -gt 0) {
     Complete-Run $EXIT.UNSUPPORTED 'VEEAM_ONE_PRESENT' 'Veeam ONE co-residence is not yet a certified topology. Handle this server manually.'
 }
-if (@($products | Where-Object { $_.Name -eq 'EnterpriseManager' }).Count -gt 0) {
-    Complete-Run $EXIT.UNSUPPORTED 'ENTERPRISE_MANAGER_PRESENT' 'Enterprise Manager can have a separate PostgreSQL configuration database, which this script does not yet discover or protect. Handle this server manually.'
-}
+$hasEnterpriseManager = @($products | Where-Object { $_.Name -eq 'EnterpriseManager' }).Count -gt 0
 
 $pgBackedProducts = @($products | Where-Object { $_.Name -eq 'VBR' -or $_.Name -eq 'VB365' })
 if ($pgBackedProducts.Count -eq 0) {
@@ -2617,6 +2615,13 @@ if ($pgBackedProducts.Count -eq 0) {
 }
 $hasVbr   = @($pgBackedProducts | Where-Object { $_.Name -eq 'VBR'   }).Count -gt 0
 $hasVb365 = @($pgBackedProducts | Where-Object { $_.Name -eq 'VB365' }).Count -gt 0
+
+# Enterprise Manager is supported only beside VBR, which is how Veeam deploys it.
+# Its own services are covered by the Veeam* service capture; only its separate
+# configuration database needs discovering. Any other pairing keeps the exclusion.
+if ($hasEnterpriseManager -and -not $hasVbr) {
+    Complete-Run $EXIT.UNSUPPORTED 'ENTERPRISE_MANAGER_WITHOUT_VBR' 'Enterprise Manager was found without Veeam Backup & Replication on this server. That topology needs its own certified profile, including service and tuning handling. Handle this server manually.'
+}
 
 if ($hasVbr -and $hasVb365) {
     Complete-Run $EXIT.UNSUPPORTED 'STACKED_VBR_VB365' 'Combined VBR+VB365 servers require a separate certified profile, especially for tuning and recovery. This initial production profile supports one of those products at a time.'
@@ -2747,6 +2752,54 @@ function ConvertFrom-PgConnectionString {
     return [pscustomobject]@{ Host=$hostName; Port=$portNumber; Database=$database }
 }
 
+# Enterprise Manager v12+ records its configuration database in the registry with
+# exactly the layout VBR uses, under its own product key. Veeam KB1471 publishes
+# the same PowerShell block for both products with only the key swapped:
+# https://www.veeam.com/kb1471   Default EM database name: VeeamBackupReporting.
+# Nothing is guessed: a missing key or value returns UNKNOWN so the caller can
+# exclude the server instead of assuming local defaults.
+function Get-VeeamRegistryPostgresDatabase {
+    param(
+        [Parameter(Mandatory)][string] $ProductKey,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $configKey = "$ProductKey\DatabaseConfigurations"
+    if (-not (Test-Path $configKey)) {
+        return [pscustomobject]@{ Kind='UNKNOWN'; Host=''; Port=0; Database=''
+            Detail = "$Label has no DatabaseConfigurations registry key (pre-v12 layout or an unexpected install), so its configuration database cannot be discovered." }
+    }
+    $active = Get-RegValue $configKey 'SqlActiveConfiguration'
+    if (-not $active) {
+        return [pscustomobject]@{ Kind='UNKNOWN'; Host=''; Port=0; Database=''
+            Detail = "$Label has no SqlActiveConfiguration value, so its database engine cannot be determined." }
+    }
+    if ("$active" -ieq 'MsSql') {
+        return [pscustomobject]@{ Kind='MSSQL'; Host=''; Port=0; Database=''; Detail = "$Label uses $active" }
+    }
+    if ("$active" -ine 'PostgreSql') {
+        return [pscustomobject]@{ Kind='UNKNOWN'; Host=''; Port=0; Database=''
+            Detail = "$Label SqlActiveConfiguration is '$active', not the exact supported values MsSql or PostgreSql." }
+    }
+    $pgKey = "$configKey\PostgreSql"
+    $dbHost = Get-RegValue $pgKey 'SqlHostName'
+    $dbPort = Get-RegValue $pgKey 'SqlHostPort'
+    $dbName = Get-RegValue $pgKey 'SqlDatabaseName'
+    $missing = @()
+    if (-not $dbHost) { $missing += 'SqlHostName' }
+    if (-not $dbPort) { $missing += 'SqlHostPort' }
+    if (-not $dbName) { $missing += 'SqlDatabaseName' }
+    if ($missing.Count -gt 0) {
+        return [pscustomobject]@{ Kind='UNKNOWN'; Host=''; Port=0; Database=''
+            Detail = "$Label's active PostgreSql configuration is missing: $($missing -join ', '). Refusing to guess local defaults." }
+    }
+    $portNumber = 0
+    if (-not [int]::TryParse("$dbPort", [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
+        return [pscustomobject]@{ Kind='UNKNOWN'; Host=''; Port=0; Database=''
+            Detail = "$Label reports invalid PostgreSQL port '$dbPort'." }
+    }
+    return [pscustomobject]@{ Kind='POSTGRES'; Host="$dbHost"; Port=$portNumber; Database="$dbName"; Detail='' }
+}
+
 function Test-Vb365CacheDatabaseName {
     param([string] $Database)
     if (-not $Database) { return $false }
@@ -2801,6 +2854,26 @@ if ($hasVbr) {
         }
     } else {
         Complete-Run $EXIT.PREFLIGHT 'VBR_DB_ENGINE_UNKNOWN' "VBR SqlActiveConfiguration is '$active', not the exact supported values MsSql or PostgreSql. Refusing to guess."
+    }
+}
+
+if ($hasEnterpriseManager) {
+    # Enterprise Manager always has its own database, separate from VBR's. It may
+    # sit in the same local instance or somewhere else, so read it rather than
+    # assume, and add it to the dump set when it is local.
+    $emDb = Get-VeeamRegistryPostgresDatabase -ProductKey $emKey -Label 'Enterprise Manager'
+    if ($emDb.Kind -eq 'MSSQL') {
+        Write-Log "Enterprise Manager uses $($emDb.Detail -replace '^Enterprise Manager uses ',''), so it is not a PostgreSQL database target. Its services are still stopped and restarted with the other Veeam services." WARN
+    } elseif ($emDb.Kind -eq 'POSTGRES') {
+        Write-Log ("Enterprise Manager database: {0} on {1}:{2}" -f $emDb.Database, $emDb.Host, $emDb.Port)
+        if (-not (Test-LocalDbHost $emDb.Host)) {
+            $remoteDatabaseProducts += "EnterpriseManager ($($emDb.Host))"
+            Write-Log "Enterprise Manager uses remote PostgreSQL at $($emDb.Host)." WARN
+        } else {
+            $veeamDatabases += [pscustomobject]@{ Product='EnterpriseManager'; Database=$emDb.Database; Port=$emDb.Port }
+        }
+    } else {
+        Complete-Run $EXIT.UNSUPPORTED 'ENTERPRISE_MANAGER_DB_UNKNOWN' "$($emDb.Detail) Handle this server manually."
     }
 }
 
@@ -3181,6 +3254,14 @@ $script:Report.PgEol = $script:EolBranch
 
 if ($script:EolBranch) {
     Write-Log "PostgreSQL $pgBranch is end-of-life (EOL $($resolvedTarget.EolDate)). Updating to its final published minor $target, but a major-version migration remains required." WARN
+}
+
+# Enterprise Manager 13 lists PostgreSQL 14.x, 15.x and 17.x; 16.x is absent from
+# that list. This update never changes the major version, so patching an existing
+# 16.x instance does not make the server any less supported than it already is.
+# Warn rather than block: withholding a security patch would be the worse outcome.
+if ($hasEnterpriseManager -and $pgBranch -eq '16') {
+    Write-Log "Enterprise Manager's documented PostgreSQL list (14.x, 15.x, 17.x) does not include 16.x, and this instance is on branch 16. The minor update to $target keeps the same major version, so this is pre-existing; raise it with Veeam separately." WARN
 }
 
 $eol = $resolvedTarget.EolDate

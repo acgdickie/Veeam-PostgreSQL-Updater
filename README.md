@@ -486,12 +486,30 @@ completed state, then remove the stale marker under the operator change record.
 
 ## Leftover Enterprise Manager records
 
-Enterprise Manager has its own configuration database, which this script does not yet
-discover or protect, so a server with Enterprise Manager **installed** is excluded
-(`ENTERPRISE_MANAGER_PRESENT`, exit 11).
+Enterprise Manager has its own configuration database, separate from VBR's. The script
+discovers it from the registry and adds it to the dump set, using the layout Veeam
+publishes in [KB1471](https://www.veeam.com/kb1471) — the same layout as VBR, under
+`HKLM\SOFTWARE\Veeam\Veeam Backup Reporting`. Its default database name is
+`VeeamBackupReporting`. Enterprise Manager's own services (`VeeamEnterpriseManagerSvc`,
+`VeeamRESTSvc`) are already covered, because every `Veeam*` service is stopped and restored.
 
-An uninstall can leave records behind, and then the server is excluded for a product that
-is not there. There are two separate records:
+Two topologies are still excluded:
+
+* **Enterprise Manager without VBR** (`ENTERPRISE_MANAGER_WITHOUT_VBR`, exit 11). That needs
+  its own profile for services and tuning.
+* **A database the script cannot read** (`ENTERPRISE_MANAGER_DB_UNKNOWN`, exit 11) — a
+  pre-v12 registry layout, a missing value, or an unexpected engine name. Nothing is guessed.
+
+If Enterprise Manager is on MS SQL, it is simply not a PostgreSQL target. Its services are
+still stopped and restarted with the rest.
+
+Enterprise Manager 13 lists PostgreSQL 14.x, 15.x and 17.x; **16.x is absent**. The update
+never changes the major version, so a 16.x instance is only warned about, not blocked.
+
+### Leftover records after an uninstall
+
+An uninstall can leave records behind, and then the server would be excluded for a product
+that is not there. There are two separate records:
 
 | Record | Where | How to clear it |
 |---|---|---|
