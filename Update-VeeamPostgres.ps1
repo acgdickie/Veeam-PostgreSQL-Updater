@@ -233,6 +233,17 @@ $script:Report       = [ordered]@{
     LogPath        = ''
 }
 
+# Collapse whitespace and cap length. Veeam can throw multi-kilobyte dependency
+# errors; one of those in the single-line RMM summary makes the whole result
+# unreadable in an RMM console. The full text always stays in the transcript.
+function Format-ShortText {
+    param([string] $Text, [int] $MaxLength = 600)
+    if (-not $Text) { return '' }
+    $flat = ($Text -replace '\s+', ' ').Trim()
+    if ($flat.Length -le $MaxLength) { return $flat }
+    return $flat.Substring(0, $MaxLength) + "... [truncated, full text in the log]"
+}
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -824,7 +835,9 @@ function Complete-Run {
 
     $script:Report.Stage   = $script:Stage
     $script:Report.Outcome = $Outcome
-    $script:Report.Detail  = (@($Detail, $stateNote) | Where-Object { $_ }) -join ' '
+    # The transcript already holds the untruncated text; keep the RMM line readable.
+    $script:Report.Detail  = Format-ShortText ((@($Detail, $stateNote) | Where-Object { $_ }) -join ' ') 900
+    if ($Detail -and "$Detail".Length -gt 900) { Write-Log "Full detail: $Detail" INFO }
     $script:Report.LogPath = $script:Transcript
     $script:Report.ExitCode = $finalCode
     if (-not $script:Report.IssueCode -and $finalCode -ne $EXIT.OK) { $script:Report.IssueCode = $Outcome }
@@ -2016,6 +2029,11 @@ function Get-ActiveVeeamWork {
         # Explorer modules expose only a subset of sessions (often those started
         # through PowerShell), so these are supplemental to the process barrier
         # below. Every object returned by these active-session APIs is busy.
+        # These are supplemental, so ANY failure here is recorded and skipped rather
+        # than failing the idle proof. On VBR 13.0.1 some Explorer modules cannot
+        # construct their own services outside an Explorer session and throw a long
+        # dependency-injection error; the process barrier is what actually covers
+        # Explorer work, and the core session getters above are the real proof.
         foreach ($commandName in @('Get-VEADRestoreSession','Get-VEHANARestoreSession','Get-VEMDBRestoreSession',
                                     'Get-VEODRestoreSession','Get-VEORRestoreSession','Get-VEORRMANRestoreSession',
                                     'Get-VEPSQLRestoreSession','Get-VESQLPluginRestoreSession','Get-VESQLRDSRestoreSession',
@@ -2027,8 +2045,8 @@ function Get-ActiveVeeamWork {
                 }
                 try {
                     $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VBR:$commandName" -AssumeReturnedActive)
-                } catch [System.NotSupportedException] {
-                    Write-Log "  $($_.Exception.Message); the Explorer process barrier still applies." WARN
+                } catch {
+                    Write-Log "  $(Format-ShortText $_.Exception.Message 300); it was not queried. The Explorer process barrier still applies." WARN
                 }
             }
         }

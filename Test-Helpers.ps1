@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter','Format-ShortText',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1197,6 +1197,14 @@ Check 'other failure keeps the reason'   ($broken.Exception.Message -match 'serv
 Check 'working getter returns sessions'  (@(Get-SessionsFromGetter 'Get-FakeWorkingGetter').Count) 2
 Check 'refusal matcher: Veeam wording'   (Test-NoAllSessionsError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Specify either -Id or -Session parameter' } })) 'True'
 Check 'refusal matcher: unrelated text'  (Test-NoAllSessionsError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Access is denied' } })) 'False'
+# A multi-kilobyte Veeam dependency error must not swamp the one-line RMM summary.
+$longText = ("word " * 500) + 'END'
+Check 'long text is truncated'           ((Format-ShortText $longText 600).Length -le 650) 'True'
+Check 'truncation is marked'             ((Format-ShortText $longText 600) -match 'truncated, full text in the log') 'True'
+Check 'short text is untouched'          (Format-ShortText 'all good' 600) 'all good'
+Check 'newlines are flattened'           (Format-ShortText "a`r`nb`tc" 600) 'a b c'
+Check 'empty text stays empty'           (Format-ShortText '' 600) ''
+Check 'Explorer failures never fatal'    ($scriptText -match 'it was not queried\. The Explorer process barrier still applies') 'True'
 Check 'configured family fails closed'  ($scriptText -match 'cannot be checked safely"\)\s*\r?\n\s*\}\s*\r?\n\s*Write-Log "  \$\(\$collector\.Command\) has no all-sessions') 'True'
 
 '--- Get-VeeamRegistryPostgresDatabase (throwaway HKCU keys, Veeam KB1471 layout) ---'
