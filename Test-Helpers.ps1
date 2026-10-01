@@ -32,6 +32,11 @@ foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Langua
 }
 function Write-Log { param($Message, $Level) }   # stub
 
+# The shipping script waits up to 10 minutes for Veeam services to settle, because
+# VBR 13's Backup Service can genuinely take minutes. Tests use fakes that never
+# settle, so shorten the window here instead of waiting it out.
+$script:ServiceSettleMinutes = 0.02
+
 $pass = 0; $fail = 0
 function Check {
     param([string]$Name, $Actual, $Expected)
@@ -1156,6 +1161,13 @@ try {
         Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+'--- Patience for VBR 13 slow service starts ---'
+Check 'settle window is 10 minutes'     ($scriptText -match '\$script:ServiceSettleMinutes = 10') 'True'
+Check 'settle window read defensively'  ($scriptText -match "Get-Variable -Name ServiceSettleMinutes -Scope Script -ValueOnly -ErrorAction SilentlyContinue") 'True'
+Check 'settle loop has a deadline'      ($scriptText -match '\$settleDeadline = \(Get-Date\)\.AddMinutes\(\$settleMinutes\)') 'True'
+Check 'settle loop logs progress'       ($scriptText -match 'waiting for \$\(\$pending\.Count\) service\(s\) to settle') 'True'
+Check 'identity service reason recorded' ($scriptText -match 'Identity Service as a CHILD PROCESS') 'True'
 
 '--- Get-VeeamServiceStartOrder (real VBR 13.0.1 dependency data) ---'
 # Deliberately listed in the alphabetical order Get-Service returns, which puts two

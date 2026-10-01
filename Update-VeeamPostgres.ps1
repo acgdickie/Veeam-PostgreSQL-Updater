@@ -206,6 +206,10 @@ $script:NatsStartupType = $null
 $script:PgServiceName = $null
 $script:PgStartupType = $null
 $script:StaleEnterpriseManagerKey = $null
+# How long to let Veeam services reach their recorded state. VBR 13's Backup
+# Service can take minutes because it starts and waits on the Identity Service as
+# a child process, so the Windows 30-second service-start timeout fires first.
+$script:ServiceSettleMinutes = 10
 $script:Vb365MaintenanceSessionId = $null
 $script:Vb365MaintenancePending = $false
 $script:RecoveryState = $null
@@ -621,7 +625,20 @@ function Restore-VeeamServiceState {
 
     # Service-control calls can time out even though SCM completes the transition
     # shortly afterward. Judge the bounded final state, not only the request call.
-    for ($attempt = 1; $attempt -le 12; $attempt++) {
+    #
+    # VBR 13's Veeam Backup Service starts the Identity Service as a CHILD PROCESS
+    # and waits for it inside its own OnStart, which routinely overruns the Windows
+    # 30-second service-start timeout. A reported v13 issue stretches that to
+    # minutes ("Failed to wait for Identity service process to be initialized:
+    # timed out"), so Start-Service throws while the service is in fact coming up.
+    # Sixty seconds of patience was not enough; wait on the real final state.
+    # Read defensively: the tests exercise this function on its own, where the
+    # script-scope setting does not exist and StrictMode would make reading it fatal.
+    $settleMinutes = Get-Variable -Name ServiceSettleMinutes -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $settleMinutes) { $settleMinutes = 10 }
+    $settleDeadline = (Get-Date).AddMinutes($settleMinutes)
+    $lastProgressLog = Get-Date
+    while ($true) {
         $pending = @()
         foreach ($rec in @($script:VeeamServices)) {
             $svc = Get-Service -Name $rec.Name -ErrorAction SilentlyContinue
@@ -631,7 +648,15 @@ function Restore-VeeamServiceState {
             if (-not $rec.WasRunning -and -not $AllowStops -and "$($svc.Status)" -notin @('Running','Stopped')) { $pending += $rec.Name }
         }
         if ($pending.Count -eq 0) { break }
-        if ($attempt -lt 12) { Start-Sleep -Seconds 5 }
+        if ((Get-Date) -ge $settleDeadline) {
+            Write-Log "Still waiting after $settleMinutes minutes: $($pending -join ', '). Verification below decides the outcome." WARN
+            break
+        }
+        if (((Get-Date) - $lastProgressLog).TotalSeconds -ge 30) {
+            Write-Log "  waiting for $($pending.Count) service(s) to settle: $($pending -join ', ')"
+            $lastProgressLog = Get-Date
+        }
+        Start-Sleep -Seconds 5
     }
     if ($stateRequestWarnings.Count -gt 0) {
         Write-Log "Service-control request warning(s); final state will decide success: $($stateRequestWarnings -join ' | ')" WARN
