@@ -1878,6 +1878,26 @@ function Get-BlockingVeeamUiProcesses {
 
 # Returns one short label per active operation. Every relevant query is fail-closed:
 # absence/error never means idle when that workload family is installed.
+# A session getter can be enumerated with no arguments only when it has a parameter
+# set whose parameters are ALL optional. VBR ships getters where every set demands
+# -Id, -Session or -Job; calling one of those bare fails with "Specify either -Id or
+# -Session parameter" and, before this check existed, failed the whole idle test on a
+# VBR 13.0.1 server. Decide from the cmdlet's own metadata on the installed build,
+# not from documentation, which differs between 13.0 and 13.1 and has gaps.
+function Test-CommandCallableBare {
+    param([Parameter(Mandatory)][string] $Name)
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command) { return $false }
+    try {
+        foreach ($set in @($command.ParameterSets)) {
+            if (@($set.Parameters | Where-Object { $_.IsMandatory }).Count -eq 0) { return $true }
+        }
+    } catch {
+        return $false   # Unreadable metadata is never treated as safe to call bare.
+    }
+    return $false
+}
+
 function Get-ActiveVeeamWork {
     param([bool] $Vbr, [bool] $Vb365)
     $active = @()
@@ -1885,6 +1905,9 @@ function Get-ActiveVeeamWork {
         foreach ($required in @('Get-VBRBackupSession','Get-VBRRestoreSession')) {
             if (-not (Get-Command $required -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new("$required is unavailable, so VBR activity cannot be checked safely")
+            }
+            if (-not (Test-CommandCallableBare $required)) {
+                throw [System.NotSupportedException]::new("$required has no all-sessions parameter set on this build, so VBR activity cannot be checked safely")
             }
         }
         $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-VBRBackupSession -ErrorAction Stop) -Prefix 'VBR:Backup')
@@ -1940,6 +1963,16 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new("$($collector.Command) is unavailable for installed family $($collector.Families -join '/')")
             }
             if ($command) {
+                if (-not (Test-CommandCallableBare $collector.Command)) {
+                    # No all-sessions set on this build. If a configured family needs
+                    # this getter, fail closed; otherwise there is nothing of that kind
+                    # to enumerate, so record the gap and carry on.
+                    if ($inUse) {
+                        throw [System.NotSupportedException]::new("$($collector.Command) has no all-sessions parameter set on this build, so configured family $($collector.Families -join '/') cannot be checked safely")
+                    }
+                    Write-Log "  $($collector.Command) has no all-sessions parameter set on this build; no configured family needs it, so it was not queried" WARN
+                    continue
+                }
                 $sessions = @(& $collector.Command -ErrorAction Stop)
                 $active += @(Get-ActiveLabelsFromSessions -Sessions $sessions -Prefix $collector.Prefix -AssumeReturnedActive:([bool]$collector.Assume))
             }
@@ -1953,6 +1986,10 @@ function Get-ActiveVeeamWork {
                                     'Get-VEPSQLRestoreSession','Get-VESQLPluginRestoreSession','Get-VESQLRDSRestoreSession',
                                     'Get-VESQLRestoreSession')) {
             if (Get-Command $commandName -ErrorAction SilentlyContinue) {
+                if (-not (Test-CommandCallableBare $commandName)) {
+                    Write-Log "  $commandName has no all-sessions parameter set on this build; it was not queried. The Explorer process barrier still applies." WARN
+                    continue
+                }
                 $active += @(Get-ActiveLabelsFromSessions -Sessions @(& $commandName -ErrorAction Stop) -Prefix "VBR:$commandName" -AssumeReturnedActive)
             }
         }

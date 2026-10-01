@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1156,6 +1156,32 @@ try {
         Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+'--- Test-CommandCallableBare (what broke the VBR 13.0.1 idle check) ---'
+# Shaped like Get-VBRSession: every parameter set demands something.
+function Get-FakeSessionNeedsId {
+    [CmdletBinding(DefaultParameterSetName='Job')]
+    param(
+        [Parameter(Mandatory, ParameterSetName='Job')] $Job,
+        [Parameter(Mandatory, ParameterSetName='Id')] $Id,
+        [Parameter(Mandatory, ParameterSetName='Session')] $Session
+    )
+}
+# Shaped like Get-VBRBackupSession: a default set where everything is optional.
+function Get-FakeSessionOptional {
+    [CmdletBinding(DefaultParameterSetName='Name')]
+    param(
+        [Parameter(ParameterSetName='Name')] $Name,
+        [Parameter(Mandatory, ParameterSetName='Id')] $Id
+    )
+}
+function Get-FakeSessionNoParams { param() }
+Check 'mandatory-only sets: not bare'   (Test-CommandCallableBare 'Get-FakeSessionNeedsId')   'False'
+Check 'optional default set: bare OK'   (Test-CommandCallableBare 'Get-FakeSessionOptional')  'True'
+Check 'no parameters at all: bare OK'   (Test-CommandCallableBare 'Get-FakeSessionNoParams')  'True'
+Check 'absent command: not bare'        (Test-CommandCallableBare 'Get-NoSuchCommandAtAll')   'False'
+Check 'idle check guards core getters'  ($scriptText -match 'has no all-sessions parameter set on this build, so VBR activity cannot be checked safely') 'True'
+Check 'configured family fails closed'  ($scriptText -match 'cannot be checked safely"\)\s*\r?\n\s*\}\s*\r?\n\s*Write-Log "  \$\(\$collector\.Command\) has no all-sessions') 'True'
 
 '--- Get-VeeamRegistryPostgresDatabase (throwaway HKCU keys, Veeam KB1471 layout) ---'
 $dbKeyRoot = "HKCU:\Software\VpguDbLayoutTest-$PID"
