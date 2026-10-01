@@ -1898,6 +1898,30 @@ function Test-CommandCallableBare {
     return $false
 }
 
+# Some getters pass parameter binding and then refuse at runtime, with Veeam's own
+# message "Specify either -Id or -Session parameter". That means the cmdlet has no
+# enumerate-everything mode on this build, which metadata alone cannot reveal.
+function Test-NoAllSessionsError {
+    param([Parameter(Mandatory)] $ErrorRecord)
+    $message = ''
+    try { $message = "$($ErrorRecord.Exception.Message)" } catch {}
+    return ($message -match 'Specify\s+either\b.*\b(Id|Session)\b')
+}
+
+# Enumerate one session getter. Any failure is reported WITH the command name, so a
+# log never leaves an operator guessing which of forty getters refused.
+function Get-SessionsFromGetter {
+    param([Parameter(Mandatory)][string] $Command)
+    try {
+        return @(& $Command -ErrorAction Stop)
+    } catch {
+        if (Test-NoAllSessionsError $_) {
+            throw [System.NotSupportedException]::new("$Command refuses to enumerate without -Id/-Session on this build: $($_.Exception.Message)")
+        }
+        throw "$Command failed: $($_.Exception.Message)"
+    }
+}
+
 function Get-ActiveVeeamWork {
     param([bool] $Vbr, [bool] $Vb365)
     $active = @()
@@ -1910,8 +1934,8 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new("$required has no all-sessions parameter set on this build, so VBR activity cannot be checked safely")
             }
         }
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-VBRBackupSession -ErrorAction Stop) -Prefix 'VBR:Backup')
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-VBRRestoreSession -ErrorAction Stop) -Prefix 'VBR:Restore')
+        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBRBackupSession') -Prefix 'VBR:Backup')
+        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBRRestoreSession') -Prefix 'VBR:Restore')
 
         # Protection-group rescans own their deployment work until the discovery
         # session completes. Get-VBRBackupSession does not reliably expose these,
@@ -1921,7 +1945,8 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new('Get-VBRSession is unavailable for configured protection groups')
             }
             foreach ($discoveryType in @('EpAgentDiscovery','EpAgentDiscoveryObsolete')) {
-                $discoverySessions = @(Get-VBRSession -Type $discoveryType -ErrorAction Stop)
+                try { $discoverySessions = @(Get-VBRSession -Type $discoveryType -ErrorAction Stop) }
+                catch { throw "Get-VBRSession -Type $discoveryType failed: $($_.Exception.Message)" }
                 $active += @(Get-ActiveLabelsFromSessions -Sessions $discoverySessions -Prefix 'VBR:ProtectionDiscovery')
             }
         }
@@ -1973,7 +1998,17 @@ function Get-ActiveVeeamWork {
                     Write-Log "  $($collector.Command) has no all-sessions parameter set on this build; no configured family needs it, so it was not queried" WARN
                     continue
                 }
-                $sessions = @(& $collector.Command -ErrorAction Stop)
+                $sessions = @()
+                try {
+                    $sessions = @(Get-SessionsFromGetter $collector.Command)
+                } catch [System.NotSupportedException] {
+                    # The getter exists but will not enumerate everything. Fail closed
+                    # when a configured family depends on it; otherwise there is nothing
+                    # of that kind here, so record the gap by name and carry on.
+                    if ($inUse) { throw }
+                    Write-Log "  $($_.Exception.Message); no configured family needs it, so it was not queried" WARN
+                    continue
+                }
                 $active += @(Get-ActiveLabelsFromSessions -Sessions $sessions -Prefix $collector.Prefix -AssumeReturnedActive:([bool]$collector.Assume))
             }
         }
@@ -1990,7 +2025,11 @@ function Get-ActiveVeeamWork {
                     Write-Log "  $commandName has no all-sessions parameter set on this build; it was not queried. The Explorer process barrier still applies." WARN
                     continue
                 }
-                $active += @(Get-ActiveLabelsFromSessions -Sessions @(& $commandName -ErrorAction Stop) -Prefix "VBR:$commandName" -AssumeReturnedActive)
+                try {
+                    $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VBR:$commandName" -AssumeReturnedActive)
+                } catch [System.NotSupportedException] {
+                    Write-Log "  $($_.Exception.Message); the Explorer process barrier still applies." WARN
+                }
             }
         }
 
@@ -2005,7 +2044,8 @@ function Get-ActiveVeeamWork {
             $unstructuredSessions = @()
             foreach ($entry in $unstructuredEntries) {
                 $escapedName = [WildcardPattern]::Escape("$($entry.Name)")
-                $unstructuredSessions += @(Get-VBRUnstructuredBackupSession -Name "${escapedName}*" -ErrorAction Stop)
+                try { $unstructuredSessions += @(Get-VBRUnstructuredBackupSession -Name "${escapedName}*" -ErrorAction Stop) }
+                catch { throw "Get-VBRUnstructuredBackupSession -Name '$escapedName*' failed: $($_.Exception.Message)" }
             }
             $unstructuredSessions = @($unstructuredSessions | Sort-Object Id -Unique)
             $active += @(Get-ActiveLabelsFromSessions -Sessions $unstructuredSessions -Prefix 'VBR:Unstructured')
@@ -2021,14 +2061,28 @@ function Get-ActiveVeeamWork {
                 $hasZeroArgumentSet = @($command.ParameterSets | Where-Object {
                     @($_.Parameters | Where-Object { $_.IsMandatory }).Count -eq 0
                 }).Count -gt 0
+                $needsPerBackup = -not $hasZeroArgumentSet
                 if ($hasZeroArgumentSet) {
-                    $transferSessions = @(& $commandName -ErrorAction Stop)
-                } else {
+                    try {
+                        $transferSessions = @(Get-SessionsFromGetter $commandName)
+                    } catch [System.NotSupportedException] {
+                        # Metadata advertised a zero-argument set, but the cmdlet refused
+                        # at runtime. Fall back to the per-backup path rather than losing
+                        # the family or failing the whole idle proof.
+                        Write-Log "  $($_.Exception.Message); falling back to per-backup enumeration" WARN
+                        $needsPerBackup = $true
+                        $transferSessions = @()
+                    }
+                }
+                if ($needsPerBackup) {
                     if (-not (Get-Command Get-VBRBackup -ErrorAction SilentlyContinue)) {
                         throw [System.NotSupportedException]::new("$commandName is available but Get-VBRBackup is not")
                     }
-                    foreach ($backup in @(Get-VBRBackup -ErrorAction Stop)) {
-                        $transferSessions += @(& $commandName -Backup $backup -ErrorAction Stop)
+                    try { $allBackups = @(Get-VBRBackup -ErrorAction Stop) }
+                    catch { throw "Get-VBRBackup failed while enumerating $commandName : $($_.Exception.Message)" }
+                    foreach ($backup in $allBackups) {
+                        try { $transferSessions += @(& $commandName -Backup $backup -ErrorAction Stop) }
+                        catch { throw "$commandName -Backup '$($backup.Name)' failed: $($_.Exception.Message)" }
                     }
                 }
                 $transferSessions = @($transferSessions | Sort-Object Id -Unique)
@@ -2050,7 +2104,8 @@ function Get-ActiveVeeamWork {
             if (-not (Get-Command $definition.Get -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new("$($definition.Get) is unavailable while refreshing $($familyGroup.Name) activity")
             }
-            $freshJobs = @(& $definition.Get -ErrorAction Stop)
+            try { $freshJobs = @(& $definition.Get -ErrorAction Stop) }
+            catch { throw "$($definition.Get) failed while refreshing $($familyGroup.Name) activity: $($_.Exception.Message)" }
             foreach ($entry in @($familyGroup.Group)) {
                 $resolvedJobs = @($freshJobs | Where-Object {
                     (Get-VeeamJobIdentity -Job $_ -Family $definition.Family) -eq "$($entry.Id)"
@@ -2068,7 +2123,8 @@ function Get-ActiveVeeamWork {
             }
             foreach ($entry in @($script:ManagedJobInventory | Where-Object { $_.Family -eq 'VBRCDP' })) {
                 $key = "$($entry.Family)::$($entry.Id)".ToLowerInvariant()
-                $session = @(Get-VBRCDPSession -Policy $freshVbrObjects[$key] -Last -ErrorAction Stop)
+                try { $session = @(Get-VBRCDPSession -Policy $freshVbrObjects[$key] -Last -ErrorAction Stop) }
+                catch { throw "Get-VBRCDPSession -Policy '$($entry.Name)' failed: $($_.Exception.Message)" }
                 $active += @(Get-ActiveLabelsFromSessions -Sessions $session -Prefix 'VBR:CDP')
             }
         }
@@ -2093,9 +2149,11 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new("$required is unavailable, so VB365 activity cannot be checked safely")
             }
         }
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-VBOJobSession -ErrorAction Stop) -Prefix 'VB365:Job')
+        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBOJobSession') -Prefix 'VB365:Job')
         # This cmdlet returns only the requested active restore sessions.
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-VBORestoreSession -Status Running -ErrorAction Stop) -Prefix 'VB365:Restore' -AssumeReturnedActive)
+        try { $vboRestoreSessions = @(Get-VBORestoreSession -Status Running -ErrorAction Stop) }
+        catch { throw "Get-VBORestoreSession -Status Running failed: $($_.Exception.Message)" }
+        $active += @(Get-ActiveLabelsFromSessions -Sessions $vboRestoreSessions -Prefix 'VB365:Restore' -AssumeReturnedActive)
         # Organization synchronization writes the PostgreSQL-backed organization
         # cache rather than a backup repository, so repository maintenance does
         # not cover it. VB365 8.6 can synchronize five parts independently.
@@ -2104,12 +2162,12 @@ function Get-ActiveVeeamWork {
         foreach ($commandName in @('Get-VBODataRetrievalSession','Get-VBODataManagementSession',
                                     'Get-VBORepositorySynchronizeSession','Get-VBORepositoryUpgradeSession')) {
             if (Get-Command $commandName -ErrorAction SilentlyContinue) {
-                $active += @(Get-ActiveLabelsFromSessions -Sessions @(& $commandName -ErrorAction Stop) -Prefix "VB365:$commandName")
+                $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VB365:$commandName")
             }
         }
         foreach ($commandName in @('Get-VBOExchangeItemRestoreSession','Get-VBOSharePointItemRestoreSession','Get-VBOTeamsItemRestoreSession')) {
             if (Get-Command $commandName -ErrorAction SilentlyContinue) {
-                $active += @(Get-ActiveLabelsFromSessions -Sessions @(& $commandName -ErrorAction Stop) -Prefix "VB365:$commandName" -AssumeReturnedActive)
+                $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VB365:$commandName" -AssumeReturnedActive)
             }
         }
     }

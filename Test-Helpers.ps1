@@ -9,7 +9,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
 
 $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
-        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare',
+        'Get-BranchKey','Compare-PgVersion','Get-CfgValue','Invoke-Native','Remove-StaleVeeamRegistryRecord','Get-VeeamRegistryPostgresDatabase','Get-RegValue','Test-CommandCallableBare','Test-NoAllSessionsError','Get-SessionsFromGetter',
         'Resolve-LatestPgTarget','ConvertFrom-PgConnectionString','Test-LocalDbHost','Test-Vb365CacheDatabaseName','Test-Vb365CacheDatabaseTemplate',
         'Get-DefaultConfig','Get-WorkRootSentinelText','Test-TrustedOwner','Test-PathTreeHasReparsePoint','Test-DirectoryHasReparseChild',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
@@ -1181,6 +1181,22 @@ Check 'optional default set: bare OK'   (Test-CommandCallableBare 'Get-FakeSessi
 Check 'no parameters at all: bare OK'   (Test-CommandCallableBare 'Get-FakeSessionNoParams')  'True'
 Check 'absent command: not bare'        (Test-CommandCallableBare 'Get-NoSuchCommandAtAll')   'False'
 Check 'idle check guards core getters'  ($scriptText -match 'has no all-sessions parameter set on this build, so VBR activity cannot be checked safely') 'True'
+# A runtime refusal must be recognised, and every failure must name its command.
+function Get-FakeRefusingGetter { [CmdletBinding()] param([string]$Name) throw 'Specify either -Id or -Session parameter' }
+function Get-FakeBrokenGetter   { [CmdletBinding()] param([string]$Name) throw 'the server is on fire' }
+function Get-FakeWorkingGetter  { [CmdletBinding()] param([string]$Name) 'session-a'; 'session-b' }
+$refusal = $null
+try { Get-SessionsFromGetter 'Get-FakeRefusingGetter' } catch { $refusal = $_ }
+Check 'runtime refusal is NotSupported'  ($refusal.Exception -is [System.NotSupportedException]) 'True'
+Check 'refusal names the command'        ($refusal.Exception.Message -match 'Get-FakeRefusingGetter') 'True'
+$broken = $null
+try { Get-SessionsFromGetter 'Get-FakeBrokenGetter' } catch { $broken = $_ }
+Check 'other failure is NOT NotSupported' ($broken.Exception -is [System.NotSupportedException]) 'False'
+Check 'other failure names the command'  ($broken.Exception.Message -match 'Get-FakeBrokenGetter') 'True'
+Check 'other failure keeps the reason'   ($broken.Exception.Message -match 'server is on fire') 'True'
+Check 'working getter returns sessions'  (@(Get-SessionsFromGetter 'Get-FakeWorkingGetter').Count) 2
+Check 'refusal matcher: Veeam wording'   (Test-NoAllSessionsError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Specify either -Id or -Session parameter' } })) 'True'
+Check 'refusal matcher: unrelated text'  (Test-NoAllSessionsError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Access is denied' } })) 'False'
 Check 'configured family fails closed'  ($scriptText -match 'cannot be checked safely"\)\s*\r?\n\s*\}\s*\r?\n\s*Write-Log "  \$\(\$collector\.Command\) has no all-sessions') 'True'
 
 '--- Get-VeeamRegistryPostgresDatabase (throwaway HKCU keys, Veeam KB1471 layout) ---'
