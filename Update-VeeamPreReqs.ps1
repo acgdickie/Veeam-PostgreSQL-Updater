@@ -256,6 +256,7 @@ $script:Report       = [ordered]@{
     UnhealthyServices = ''
     ServicesStarted = ''
     ConsolesClosed = ''
+    Vb365SyncStuck = ''
     RecoveryRunDir = ''
     Detail         = ''
     LogPath        = ''
@@ -2072,31 +2073,59 @@ function Get-ActiveLabelsFromSessions {
     return $labels
 }
 
-# True when a Queued VB365 organisation sync is due to start: its ScheduledTime has
-# passed, falls within the guard window, or cannot be read. Veeam documents Queued
-# with a later ScheduledTime as the normal state between syncs. A time with no zone
-# is read both as UTC and as local time, and the earlier reading wins, so a wrong
-# guess makes the run wait rather than miss a sync. A sync that starts later is
-# still caught by the activity read just before services stop.
-function Test-Vb365QueuedSyncDue {
+# Judges a Queued VB365 organisation sync from its ScheduledTime:
+#   Later - booked beyond the guard window. Veeam documents this as the normal
+#           state between the daily syncs, so it does not hold the run.
+#   Due   - overdue by less than the stuck limit, starting within the guard window,
+#           or with no readable time. The run waits for it.
+#   Stuck - overdue by more than the stuck limit and never started. A sync booked
+#           days ago that never ran is not writing the organisation cache, so the
+#           run warns and does not wait 12 hours for it.
+# A time with no zone is read both as UTC and as local time. It is Later only if
+# both readings are, and Stuck only if both readings are, so a wrong guess makes
+# the run wait. A sync that starts later is still caught by the activity read just
+# before services stop.
+function Get-Vb365QueuedSyncTiming {
     param(
         [Parameter(Mandatory)] $CurrentState,
         [int] $GuardMinutes = 15,
+        [int] $StuckAfterMinutes = 60,
         [datetime] $NowUtc = [datetime]::UtcNow
     )
-    if ($CurrentState.PSObject.Properties.Name -notcontains 'ScheduledTime') { return $true }
+    $names = @($CurrentState.PSObject.Properties.Name)
+    if ($names -notcontains 'ScheduledTime') { return 'Due' }
+    # A start time on a Queued sync is not a documented combination: wait.
+    if ($names -contains 'StartTime' -and $null -ne $CurrentState.StartTime) { return 'Due' }
     $scheduled = $CurrentState.ScheduledTime
     if ($scheduled -is [DateTimeOffset]) { $scheduled = $scheduled.UtcDateTime }
-    if ($scheduled -isnot [datetime] -or $scheduled.Year -le 1900) { return $true }
-    $limit = $NowUtc.AddMinutes($GuardMinutes)
+    if ($scheduled -isnot [datetime] -or $scheduled.Year -le 1900) { return 'Due' }
     $readings = if ($scheduled.Kind -eq [DateTimeKind]::Unspecified) {
         @([datetime]::SpecifyKind($scheduled, [DateTimeKind]::Utc),
           [datetime]::SpecifyKind($scheduled, [DateTimeKind]::Local).ToUniversalTime())
     } else {
         @($scheduled.ToUniversalTime())
     }
-    foreach ($reading in $readings) { if ($reading -le $limit) { return $true } }
-    return $false
+    $guard = $NowUtc.AddMinutes($GuardMinutes)
+    $stuckBefore = $NowUtc.AddMinutes(-$StuckAfterMinutes)
+    if (@($readings | Where-Object { $_ -le $guard }).Count -eq 0) { return 'Later' }
+    if (@($readings | Where-Object { $_ -ge $stuckBefore }).Count -eq 0) { return 'Stuck' }
+    return 'Due'
+}
+
+# Say once per organisation per run that its sync is stuck, in the log and in the
+# RMM summary. The idle check runs many times while it waits.
+function Write-Vb365StuckSyncOnce {
+    param([Parameter(Mandatory)][string] $Organization, $ScheduledTime)
+    $seen = Get-Variable -Name Vb365StuckSyncSeen -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $seen) {
+        $seen = @{}
+        Set-Variable -Name Vb365StuckSyncSeen -Scope Script -Value $seen
+    }
+    if ($seen.ContainsKey($Organization)) { return }
+    $seen[$Organization] = $true
+    $when = if ($ScheduledTime -is [datetime]) { $ScheduledTime.ToString('yyyy-MM-dd HH:mm') } else { "$ScheduledTime" }
+    Write-Log "VB365 organisation sync for $Organization was booked for $when and never started. It is stuck, not running, so the update does not wait for it. VB365 has not refreshed this organisation's data since then: check VB365 on this server." WARN
+    Add-ReportListItem -Field 'Vb365SyncStuck' -Value "$Organization (queued since $when)"
 }
 
 function Get-ActiveVb365OrganizationSyncWork {
@@ -2155,7 +2184,16 @@ function Get-ActiveVb365OrganizationSyncWork {
             }
             # Queued is VB365's resting state between its daily syncs: it only books
             # the next one. Wait only when that sync is due, or its time is unreadable.
-            if ($status -eq 'Queued' -and -not (Test-Vb365QueuedSyncDue -CurrentState $current.Value)) { continue }
+            # One overdue for more than an hour that never started is stuck: warn, do
+            # not wait.
+            if ($status -eq 'Queued') {
+                $timing = Get-Vb365QueuedSyncTiming -CurrentState $current.Value
+                if ($timing -eq 'Later') { continue }
+                if ($timing -eq 'Stuck') {
+                    Write-Vb365StuckSyncOnce -Organization $organizationLabel -ScheduledTime $current.Value.ScheduledTime
+                    continue
+                }
+            }
             $labels += "VB365:OrganizationSync:${organizationLabel}:$($current.Scope):$status"
         }
     }

@@ -41,7 +41,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
         'Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
         'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById',
-        'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Test-Vb365QueuedSyncDue','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
+        'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier',
         'Get-UnrestoredJobNames',
         'Write-AtomicText','Write-AtomicJson','Set-RecoveryProperty','Save-RecoveryState',
@@ -819,12 +819,38 @@ $script:FakeVboOrganizationSyncState.CurrentState = [pscustomobject]@{ Status='F
 Check 'unknown sync status with a time still fails closed' (Throws { Get-ActiveVeeamWork -Vbr $false -Vb365 $true }) 'True'
 
 $now = [datetime]::new(2026, 10, 13, 1, 0, 0, [DateTimeKind]::Utc)
-Check 'due: no ScheduledTime property'         (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ Status='Queued' }) -NowUtc $now) 'True'
-Check 'due: placeholder year 1'                (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[datetime]::MinValue }) -NowUtc $now) 'True'
-Check 'not due: UTC time in 6 hours'           (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=$now.AddHours(6) }) -NowUtc $now) 'False'
-Check 'not due: offset time in 6 hours'        (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[DateTimeOffset]::new($now.AddHours(6)) }) -NowUtc $now) 'False'
-Check 'due: zone-less time 5 min ahead'        (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[datetime]::SpecifyKind($now.AddMinutes(5), [DateTimeKind]::Unspecified) }) -NowUtc $now) 'True'
-Check 'not due: zone-less time next year'      (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[datetime]::SpecifyKind($now.AddYears(1), [DateTimeKind]::Unspecified) }) -NowUtc $now) 'False'
+function Timing($When, $Start = $null) { Get-Vb365QueuedSyncTiming -CurrentState ([pscustomobject]@{ Status='Queued'; ScheduledTime=$When; StartTime=$Start }) -NowUtc $now }
+Check 'due: no ScheduledTime property'         (Get-Vb365QueuedSyncTiming -CurrentState ([pscustomobject]@{ Status='Queued' }) -NowUtc $now) 'Due'
+Check 'due: placeholder year 1'                (Timing ([datetime]::MinValue)) 'Due'
+Check 'later: UTC time in 6 hours'             (Timing $now.AddHours(6)) 'Later'
+Check 'later: offset time in 6 hours'          (Timing ([DateTimeOffset]::new($now.AddHours(6)))) 'Later'
+Check 'due: zone-less time 5 min ahead'        (Timing ([datetime]::SpecifyKind($now.AddMinutes(5), [DateTimeKind]::Unspecified))) 'Due'
+Check 'later: zone-less time next year'        (Timing ([datetime]::SpecifyKind($now.AddYears(1), [DateTimeKind]::Unspecified))) 'Later'
+Check 'due: 30 minutes overdue'                (Timing $now.AddMinutes(-30)) 'Due'
+Check 'stuck: 13 days overdue, never started'  (Timing $now.AddDays(-13)) 'Stuck'
+Check 'due: overdue but has a start time'      (Timing $now.AddDays(-13) $now.AddMinutes(-2)) 'Due'
+Check 'stuck: zone-less 3 days overdue'        (Timing ([datetime]::SpecifyKind($now.AddDays(-3), [DateTimeKind]::Unspecified))) 'Stuck'
+Check 'due: zone-less 10 min overdue'          (Timing ([datetime]::SpecifyKind($now.AddMinutes(-10), [DateTimeKind]::Unspecified))) 'Due'
+
+# A VB365 server's sync was booked for 13 days earlier and never started: every part
+# Queued, no start time, Mailboxes out of scope. The run waited for it.
+$priorReport = Get-Variable -Name Report -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+$script:Report = [ordered]@{ Vb365SyncStuck = '' }
+Remove-Variable -Name Vb365StuckSyncSeen -Scope Script -ErrorAction SilentlyContinue
+$stale = [datetime]::UtcNow.AddDays(-13)
+$script:FakeVboOrganizationSyncState = [pscustomobject]@{
+    CurrentState = [pscustomobject]@{ Status='Queued'; ScheduledTime=$stale; StartTime=$null }
+    Parts = [pscustomobject]@{ Users=(Q $stale); Groups=(Q $stale); GroupMembers=(Q $stale); Sites=(Q $stale); Mailboxes=$null }
+}
+Check 'stuck sync does not hold the run'       @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true).Count 0
+Check 'stuck sync reaches the RMM summary'     ($script:Report.Vb365SyncStuck -match '^Org A \(queued since \d{4}-\d\d-\d\d \d\d:\d\d\)$') 'True'
+$null = @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true)
+Check 'stuck sync is reported once per run'    @($script:Report.Vb365SyncStuck -split ', ').Count 1
+$script:FakeVboOrganizationSyncState.Parts.Users = [pscustomobject]@{ CurrentState = [pscustomobject]@{ Status='Running'; ScheduledTime=$stale; StartTime=[datetime]::UtcNow } }
+Check 'a running part still holds the run'     (@(Get-ActiveVeeamWork -Vbr $false -Vb365 $true) -contains 'VB365:OrganizationSync:Org A:Users:Running') 'True'
+Remove-Variable -Name Vb365StuckSyncSeen -Scope Script -ErrorAction SilentlyContinue
+if ($null -eq $priorReport) { Remove-Variable -Name Report -Scope Script -ErrorAction SilentlyContinue } else { $script:Report = $priorReport }
+Check 'report has a Vb365SyncStuck field'      ($scriptText -match "(?m)^\s+Vb365SyncStuck = ''") 'True'
 
 $script:FakeVboOrganizationSyncState = [pscustomobject]@{
     CurrentState = $null

@@ -175,9 +175,10 @@ an EOL server with a post-update service failure returns `40`, not `8`.
 
 The console summary and `last-result.json` include `ExitCode`, `IssueCode`,
 `ActionRequired`, `JobsLeftDisabled`, `UnhealthyServices`, `ServicesStarted`,
-`ConsolesClosed`, `RecoveryRunDir`, and `Detail`. `ServicesStarted` lists stopped
-automatic Veeam services the run started to rescue a failed configuration backup, and
-`ConsolesClosed` lists the Veeam consoles it closed.
+`ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, and `Detail`. `ServicesStarted` lists
+stopped automatic Veeam services the run started to rescue a failed configuration backup,
+`ConsolesClosed` lists the Veeam consoles it closed, and `Vb365SyncStuck` names any VB365
+organisation whose data sync is stuck: VB365 needs attention there.
 Those fields are the RMM-readable issue note for any action-bearing result; they name what
 is unhealthy, what remains disabled, and where recovery evidence lives.
 
@@ -316,8 +317,9 @@ legacy VBR discovery-session types. VB365 whole-organization synchronization and
 its Users, Groups, GroupMembers, Sites, and Mailboxes parts are also fail-closed activity
 barriers because they write the PostgreSQL-backed organization cache. A sync that is only
 `Queued` for a later time is VB365's normal state between its daily syncs and does not
-hold the run; one that is running, overdue, due within 15 minutes, or has no readable
-time does. A VB365 job session that ended as `Disconnected` does not count as running,
+hold the run; one that is running, overdue by up to an hour, due within 15 minutes, or
+has no readable time does. One overdue by more than an hour that never started is stuck,
+not running: the run warns, names it in `Vb365SyncStuck`, and does not wait for it. A VB365 job session that ended as `Disconnected` does not count as running,
 because VB365 never resumes it.
 
 If work is active, the script waits for it to finish naturally for up to
