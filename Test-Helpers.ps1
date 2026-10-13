@@ -2924,7 +2924,7 @@ try {
             Name='nats-server'; Status='Running'; WasRunning=$true; StartupType='Automatic'; PathName='"C:\old\nats-server.exe" -c "C:\c.conf"' })
 
         $EXIT = @{ OK=0; ESCALATE=40; ESCALATE_NOW=50 }
-        $script:Report = [ordered]@{ RecoveryRunDir=''; VeeamProducts=''; PgInstalled=''; PgTarget=''; JobsLeftDisabled=''; IssueCode=''; ActionRequired=''; NatsInstalled=''; NatsTarget=''; NatsStatus='' }
+        $script:Report = [ordered]@{ RecoveryRunDir=''; VeeamProducts=''; PgInstalled=''; PgTarget=''; JobsLeftDisabled=''; IssueCode=''; ActionRequired=''; NatsInstalled=''; NatsTarget=''; NatsStatus=''; NatsDetail='' }
         function Test-TrustedOwner { param($Path) return $true }
         function Get-Service {
             [CmdletBinding()] param([Parameter(Position=0)][string[]] $Name)
@@ -2970,7 +2970,7 @@ try {
             $script:Svc = @{} + $Services
             $script:FakeNatsHealthy = $Healthy; $script:FakeRevertProblem = $RevertProblem
             $script:Actions = @(); $script:RecoveryCapture = $null
-            $script:Report.IssueCode = ''; $script:Report.ActionRequired = ''; $script:Report.NatsStatus = ''; $script:Report.NatsInstalled = ''
+            $script:Report.IssueCode = ''; $script:Report.ActionRequired = ''; $script:Report.NatsStatus = ''; $script:Report.NatsInstalled = ''; $script:Report.NatsDetail = ''
             $state = [ordered]@{
                 SchemaVersion=$Schema; RunId=$runId; RunDir=$runPath; Stage=$Stage; InstallerStarted=$false
                 Products='VB365'; OriginalVersion='15.19'; TargetVersion='15.19'
@@ -2997,6 +2997,7 @@ try {
         Check 'NATS switched: PostgreSQL never stopped' ($a -contains 'STOP:postgresql-x64-15') 'False'
         Check 'NATS switched: marker removed'         ($a -contains 'MARKER-REMOVED') 'True'
         Check 'NATS switched: status'                 $script:Report.NatsStatus 'UPDATE_FAILED_REVERTED'
+        Check 'NATS switched: detail'                 ($script:Report.NatsDetail -match 'put NATS 2\.10\.22 back') 'True'
 
         Invoke-TestNatsRecover -NatsStage 'VEEAM_STARTED' -Healthy $true -Services $runningAll
         $a = @($script:Actions)
@@ -3005,6 +3006,7 @@ try {
         Check 'healthy on the new NATS: committed'    (@($a | Where-Object { $_ -eq 'SAVE:COMPLETE:COMMITTED' }).Count) 1
         Check 'healthy on the new NATS: jobs back on' (@($a | Where-Object { $_ -like 'ENABLE:*' }).Count) 2
         Check 'healthy on the new NATS: version'      $script:Report.NatsInstalled '2.10.28'
+        Check 'healthy on the new NATS: detail'       ($script:Report.NatsDetail -match 'is in place') 'True'
 
         Invoke-TestNatsRecover -NatsStage 'VEEAM_STARTED' -Healthy $false -Services $runningAll
         Check 'unhealthy on the new NATS: put back'   "$($script:RecoveryCapture.Outcome) $($script:Actions -contains 'NATS-REVERT')" 'RECOVERED_NATS_REVERTED True'
@@ -3082,6 +3084,8 @@ Check 'a NATS run never runs an installer'     ($natsFlow -match 'Start-Process'
 Check 'a NATS run never books a restart'       ($natsFlow -match 'Invoke-DelayedReboot|shutdown\.exe') 'False'
 Check 'a NATS run is recorded as schema 2'     ($natsFlow -match 'SchemaVersion\s+= 2') 'True'
 Check 'a NATS run needs no reboot'             ($natsFlow -match '\$script:Report\.RebootRequired = \$false') 'True'
+# The audit's "is available" text must not survive a run that updated NATS.
+Check 'a finished update replaces the audit detail' ((Get-FlowAt "`$script:Report.NatsStatus = 'UPDATED'") -lt (Get-FlowAt '$script:Report.NatsDetail = "This run updated NATS')) 'True'
 $natsCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-NatsOnlyUpdate' }, $true))
 Check 'the NATS run starts from one place'     $natsCalls.Count 1
 Check 'NATS goes only when PostgreSQL needs nothing' ($scriptText -match 'if \(\$natsDue -and \$versionComparison -ge 0\)') 'True'

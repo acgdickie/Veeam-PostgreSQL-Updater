@@ -2111,6 +2111,7 @@ function Invoke-NatsOnlyUpdate {
     $script:Report.NatsInstalled = $natsTo
     $script:Report.NatsTarget = $natsTo
     $script:Report.NatsStatus = 'UPDATED'
+    $script:Report.NatsDetail = "This run updated NATS $natsFrom -> $natsTo, and VB365 verified healthy on it."
     Write-Log "VB365 is healthy on NATS $natsTo" OK
 
     # -----------------------------------------------------------------------
@@ -2489,11 +2490,20 @@ function Complete-Run {
 
     # A NATS update that ended early: say how far NATS got.
     if ($script:Report.Contains('NatsStatus') -and "$($script:Report['NatsStatus'])" -eq 'UPDATING') {
-        $finalNatsStage = (Get-NatsRunFacts).Stage
+        $natsEnd = Get-NatsRunFacts
+        $finalNatsStage = $natsEnd.Stage
         $script:Report['NatsStatus'] = if ($finalNatsStage -eq 'REVERTED') { 'UPDATE_FAILED_REVERTED' }
             elseif ($finalNatsStage -eq 'COMMITTED') { 'UPDATED' }
             elseif ($finalNatsStage -in @('','PLANNED','BACKING_UP','BACKED_UP')) { 'NOT_UPDATED' }
             else { 'UPDATE_FAILED' }
+        # Replace the audit's "is available" text with what this run left behind.
+        $natsEndDetail = switch ("$($script:Report['NatsStatus'])") {
+            'UPDATE_FAILED_REVERTED' { "The update to NATS $($natsEnd.TargetVersion) failed, and NATS $($natsEnd.OldVersion) was put back." }
+            'UPDATED'                { "NATS $($natsEnd.TargetVersion) is in place and verified." }
+            'NOT_UPDATED'            { "The run ended before NATS was changed. NATS $($natsEnd.OldVersion) -> $($natsEnd.TargetVersion) is still due." }
+            default                  { "The update to NATS $($natsEnd.TargetVersion) stopped part-way. Read ActionRequired." }
+        }
+        if ($natsEnd.IsNatsRun) { $script:Report['NatsDetail'] = $natsEndDetail }
     }
 
     $script:Report.Stage   = $script:Stage
@@ -4646,10 +4656,12 @@ function Invoke-ExplicitRecovery {
         if ($natsKeptNew) {
             $script:Report.NatsInstalled = "$($natsPlan.TargetVersion)"
             $script:Report.NatsStatus = 'UPDATED'
+            $script:Report.NatsDetail = "-Recover finished the update: NATS $($natsPlan.TargetVersion) is in place."
             Complete-Run $EXIT.OK 'RECOVERED_NATS_UPDATED' "NATS runs $($natsPlan.TargetVersion), as the interrupted run intended. The captured NATS, Veeam service and job states were restored and verified. PostgreSQL was not touched."
         }
         if ("$(Get-CfgValue $script:RecoveryState 'NatsStage' '')" -eq 'REVERTED') {
             $script:Report.NatsStatus = 'UPDATE_FAILED_REVERTED'
+            $script:Report.NatsDetail = "-Recover put NATS $($natsPlan.OldVersion) back. The update to $($natsPlan.TargetVersion) is still due."
             Complete-Run $EXIT.OK 'RECOVERED_NATS_REVERTED' "NATS is back on $($natsPlan.OldVersion). The captured NATS, Veeam service and job states were restored and verified. PostgreSQL was not touched."
         }
         $script:Report.NatsStatus = 'NOT_UPDATED'
