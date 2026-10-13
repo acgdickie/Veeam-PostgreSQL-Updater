@@ -20,8 +20,9 @@
     VB365 only: it also updates NATS, the nats-server service VB365 8 uses for its
     job queue, as Veeam KB4742 describes (https://www.veeam.com/kb4742). Again an
     update, never an upgrade: only to a newer version Veeam supports on the SAME
-    2.x line (2.10.22 -> 2.10.28, never 2.10 -> 2.12), and only a download that
-    matches a SHA256 pinned in this script. One change per run: when PostgreSQL
+    2.x line (2.10.22 -> 2.10.28, never 2.10 -> 2.12). Each run reads Veeam's
+    current NATS list from Veeam's website, and the download must match the
+    SHA256 published with the NATS release. One change per run: when PostgreSQL
     also needs an update, this run updates PostgreSQL and the next -Install run
     updates NATS. Set updateNats to false below to only report NATS.
 
@@ -81,7 +82,8 @@
 .PARAMETER SkipDownloadInAudit
     Audit mode normally checks the EnterpriseDB download page for the exact
     Windows x64 installer. This skips that check. The audit still contacts
-    postgresql.org to resolve the latest minor release.
+    postgresql.org to resolve the latest minor release, and on VB365 it still
+    reads Veeam's help center (and GitHub when a NATS update is due).
 
 .NOTES
     EXIT CODES (for your RMM):
@@ -467,7 +469,7 @@ function Get-RmmActionForExitCode {
         10 { return 'Retry this script later; no forced job termination was attempted.' }
         11 { return 'Handle this unsupported or excluded topology manually.' }
         20 { return 'Investigate the preflight failure before retrying.' }
-        30 { return 'Investigate the download and its check (EnterpriseDB page and signature for PostgreSQL, pinned SHA256 for NATS).' }
+        30 { return 'Investigate the download and its check (EnterpriseDB page and signature for PostgreSQL, SHA256 for NATS).' }
         40 { return 'PAGE AN OPERATOR. Read Detail and RecoveryRunDir; jobs may remain disabled.' }
         50 { return 'PAGE AN OPERATOR NOW. PostgreSQL verification failed; use the recovery evidence.' }
         default { return 'Investigate the undocumented exit code.' }
@@ -885,10 +887,11 @@ function Invoke-VbrConfigBackupAttempt {
 # 2.12), so the message store format stays the same and the old version can go back.
 # ---------------------------------------------------------------------------
 
-# The NATS versions Veeam supports per VB365 release, and the SHA256 of every package
-# this script may install. NATS publishes no signature, so the pinned hash is the only
-# proof a download is genuine. Add a version only after Veeam lists it, with the hash
-# from that release's SHA256SUMS file: https://github.com/nats-io/nats-server/releases
+# The fallback NATS list per VB365 release, and the SHA256 of known packages. Each
+# run reads Veeam's current list from its website (Get-NatsSupportedVersions); this
+# list is used only when that page cannot be read or describes another VB365 release.
+# A hash pinned here must agree with the release's own SHA256SUMS. A version with no
+# pinned hash is checked against SHA256SUMS alone (Resolve-NatsPackageSha256).
 function Get-NatsPolicy {
     return [pscustomobject]@{
         SupportedByVb365 = @{
@@ -901,47 +904,153 @@ function Get-NatsPolicy {
     }
 }
 
-# Veeam.Archiver.Service.exe on VB365 8.6 reports its version as 13.6.x. A release
-# that is not named here gets no NATS changes until its supported list is added.
+# Veeam.Archiver.Service.exe reports VB365 8.x as 13.x (8.6 reports 13.6.0.0).
+# Returns the release as Veeam's website names it, for example '8.6'.
 function Get-Vb365ReleaseKey {
     param([AllowEmptyString()][string] $ProductVersion)
-    if ("$ProductVersion" -match '^(?:13\.6|8\.6)(?:\.|$)') { return '8.6' }
+    if ("$ProductVersion" -match '^(?:13|8)\.(\d+)(?:\.|$)') { return "8.$($Matches[1])" }
     return ''
 }
 
-# Pick the update for an installed NATS version: the newest version Veeam lists on the
-# same major.minor line that is newer than the installed one and has a pinned hash.
-# Never a different line, and never older.
+# Download a small text file (a web page, a SHA256SUMS file) as a string.
+function Invoke-NatsWebText {
+    param([Parameter(Mandatory)][string] $Uri, [int] $TimeoutSec = 30)
+    # STEP 6C runs before STEP 7 sets this. Windows PowerShell 5.1 needs it for TLS 1.2.
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+    $oldProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try { $response = Invoke-WebRequest -Uri $Uri -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop }
+    finally { $ProgressPreference = $oldProgress }
+    # Decode the bytes as UTF-8 on both editions. Veeam's page is UTF-8 but is served
+    # with no charset, and Windows PowerShell 5.1 then decodes .Content as ISO-8859-1,
+    # which turns a no-break space into two other characters. GitHub's SHA256SUMS comes
+    # back as bytes anyway.
+    if ($response.PSObject.Properties.Name -contains 'RawContentStream' -and $response.RawContentStream) {
+        return [Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())
+    }
+    if ($response.Content -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($response.Content) }
+    return "$($response.Content)"
+}
+
+# Veeam's VB365 system requirements page lists the supported NATS versions in one
+# sentence ("... installation of the NATS server 2.10.18, 2.10.22, 2.10.28, ...") and
+# ends with "Page content applies to build 8.6.0.1102". It always describes the newest
+# VB365 release. Anything other than exactly one of each is refused. The list must run
+# from "NATS server" to the full stop that ends the sentence, separated only by commas,
+# "and" or "or". Any other wording (a range, a bullet list, a semicolon, a note after the
+# list such as "starting from build ...") is refused rather than read as a shorter list,
+# so the caller falls back to the built-in list.
+function ConvertFrom-VeeamNatsRequirementsHtml {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Html)
+    $text = [Net.WebUtility]::HtmlDecode(($Html -replace '<[^>]+>', ' ')) -replace '\s+', ' '
+    $builds = @([regex]::Matches($text, '(?i)Page content applies to build (\d+\.\d+\.\d+\.\d+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    if ($builds.Count -ne 1) { throw "the page names $($builds.Count) VB365 builds, not one" }
+    $lists = @([regex]::Matches($text, '(?i)\bNATS server (\d+\.\d+\.\d+(?:(?:\s*,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)\d+\.\d+\.\d+)*)(?=\s*(?:\.(?!\d)|$))') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    if ($lists.Count -ne 1) { throw "the page has $($lists.Count) NATS version lists, not one" }
+    $versions = @([regex]::Matches($lists[0], '\d+\.\d+\.\d+') | ForEach-Object { $_.Value } | Sort-Object -Unique | Sort-Object { [version]$_ })
+    if ($versions.Count -gt 40) { throw "the page lists $($versions.Count) NATS versions" }
+    $build = [version]$builds[0]
+    return [pscustomobject]@{ Build=$builds[0]; Release=('{0}.{1}' -f $build.Major, $build.Minor); Versions=$versions }
+}
+
+# The NATS versions Veeam supports for this server's VB365 release. Veeam's website is
+# read on every run, so a version Veeam adds is picked up without a script change.
+# It is used only when the page describes this same release (major.minor); otherwise,
+# or when the page cannot be read, the list built into Get-NatsPolicy is used. Never
+# throws. Detail says which list was used and why.
+function Get-NatsSupportedVersions {
+    param(
+        [AllowEmptyString()][string] $ReleaseKey,
+        [Parameter(Mandatory)] $Policy,
+        [string] $Url = 'https://helpcenter.veeam.com/docs/vbo365/guide/vbo_system_requirements.html'
+    )
+    $why = ''
+    try {
+        $page = ConvertFrom-VeeamNatsRequirementsHtml (Invoke-NatsWebText -Uri $Url)
+        if (-not $ReleaseKey) {
+            $why = "this server's VB365 release is unknown"
+        } elseif ($page.Release -ne $ReleaseKey) {
+            $why = "Veeam's page describes VB365 $($page.Release) (build $($page.Build)), not this server's $ReleaseKey"
+        } else {
+            return [pscustomobject]@{ Source='Veeam'; Versions=@($page.Versions); Detail="Veeam's current list for VB365 build $($page.Build)" }
+        }
+    } catch {
+        $why = "Veeam's page could not be read: $(Format-ShortText $_.Exception.Message 150)"
+    }
+    if ($ReleaseKey -and $Policy.SupportedByVb365.ContainsKey($ReleaseKey)) {
+        return [pscustomobject]@{ Source='BuiltIn'; Versions=@($Policy.SupportedByVb365[$ReleaseKey]); Detail="the list built into this script, because $why" }
+    }
+    return [pscustomobject]@{ Source='None'; Versions=@(); Detail=$why }
+}
+
+# One line of a SHA256SUMS file: "<64 hex>  nats-server-v<x.y.z>-windows-amd64.zip".
+function ConvertFrom-NatsSha256Sums {
+    param([AllowEmptyString()][string] $Text, [Parameter(Mandatory)][string] $Version)
+    $name = "nats-server-v$Version-windows-amd64.zip"
+    $hashes = @(("$Text" -split "`r?`n") | ForEach-Object {
+        if ($_ -match '^\s*([0-9a-fA-F]{64})\s+\*?(\S+)\s*$' -and $Matches[2] -ceq $name) { $Matches[1].ToLowerInvariant() }
+    } | Sort-Object -Unique)
+    if ($hashes.Count -eq 1) { return $hashes[0] }
+    return ''
+}
+
+# The SHA256 the NATS download must match. NATS publishes no signature, only a
+# SHA256SUMS file in each GitHub release. That file proves the download arrived whole,
+# but it comes from the same release as the file. A hash pinned in Get-NatsPolicy
+# guards against a release that was changed later: it must agree with SHA256SUMS
+# whenever that file can be read, and it is used alone when it cannot.
+function Resolve-NatsPackageSha256 {
+    param([Parameter(Mandatory)][string] $Version, [Parameter(Mandatory)] $Policy)
+    $pinned = ''
+    if ($Policy.PackageSha256.ContainsKey($Version)) { $pinned = "$($Policy.PackageSha256[$Version])".ToLowerInvariant() }
+    $published = ''
+    $why = ''
+    $sumsUrl = "https://github.com/nats-io/nats-server/releases/download/v$Version/SHA256SUMS"
+    try {
+        $published = ConvertFrom-NatsSha256Sums -Text (Invoke-NatsWebText -Uri $sumsUrl) -Version $Version
+        if (-not $published) { $why = "the release's SHA256SUMS has no single line for nats-server-v$Version-windows-amd64.zip" }
+    } catch {
+        $why = "the release's SHA256SUMS could not be read: $(Format-ShortText $_.Exception.Message 150)"
+    }
+    if ($pinned -and $published -and $pinned -ne $published) {
+        return [pscustomobject]@{ Sha256=''; Source='Conflict'
+            Detail="the SHA256 built into this script for NATS $Version ($pinned) differs from the release's SHA256SUMS ($published), so the GitHub release may have been changed after it was published" }
+    }
+    if ($pinned) {
+        $how = if ($published) { "built into this script and matching the release's SHA256SUMS" } else { "built into this script ($why)" }
+        return [pscustomobject]@{ Sha256=$pinned; Source='Pinned'; Detail=$how }
+    }
+    if ($published) { return [pscustomobject]@{ Sha256=$published; Source='SHA256SUMS'; Detail="from the release's SHA256SUMS on GitHub" } }
+    return [pscustomobject]@{ Sha256=''; Source='None'; Detail=$why }
+}
+
+# Pick the update for an installed NATS version: the newest version on Veeam's list on
+# the same major.minor line that is newer than the installed one. Never a different
+# line, and never older.
 function Resolve-NatsTarget {
     param(
         [Parameter(Mandatory)][string] $Installed,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Supported,
-        [Parameter(Mandatory)][hashtable] $PackageSha256
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Supported
     )
     $have = [version]$Installed
     $line = '{0}.{1}' -f $have.Major, $have.Minor
     $sameLine = @($Supported | ForEach-Object { [version]$_ } |
         Where-Object { $_.Major -eq $have.Major -and $_.Minor -eq $have.Minor } | Sort-Object)
     $newer = @($sameLine | Where-Object { $_ -gt $have })
-    $pinned = @($newer | Where-Object { $PackageSha256.ContainsKey("$_") })
-    if ($pinned.Count -gt 0) {
-        $to = "$($pinned[$pinned.Count - 1])"
-        return [pscustomobject]@{ Status='UPDATE_AVAILABLE'; Target=$to; Sha256="$($PackageSha256[$to])".ToLowerInvariant()
-            Detail="NATS $Installed -> $to is available (same $line line, on Veeam's supported list)." }
-    }
     if ($newer.Count -gt 0) {
-        return [pscustomobject]@{ Status='UNPINNED'; Target="$($newer[$newer.Count - 1])"; Sha256=''
-            Detail="Veeam lists NATS $($newer[$newer.Count - 1]), but this script has no pinned SHA256 for it, so NATS $Installed is left alone. Add it to Get-NatsPolicy." }
+        $to = "$($newer[$newer.Count - 1])"
+        return [pscustomobject]@{ Status='UPDATE_AVAILABLE'; Target=$to
+            Detail="NATS $Installed -> $to is available (same $line line, on Veeam's supported list)." }
     }
     $listed = @($sameLine | Where-Object { $_ -eq $have }).Count -gt 0
     if ($listed) {
-        return [pscustomobject]@{ Status='CURRENT'; Target=''; Sha256=''; Detail="NATS $Installed is the newest version Veeam lists on the $line line." }
+        return [pscustomobject]@{ Status='CURRENT'; Target=''; Detail="NATS $Installed is the newest version Veeam lists on the $line line." }
     }
     if ($sameLine.Count -gt 0 -and $have -gt $sameLine[$sameLine.Count - 1]) {
-        return [pscustomobject]@{ Status='AHEAD'; Target=''; Sha256=''
+        return [pscustomobject]@{ Status='AHEAD'; Target=''
             Detail="NATS $Installed is newer than the newest version Veeam lists on the $line line ($($sameLine[$sameLine.Count - 1])). Left alone: NATS is never downgraded." }
     }
-    return [pscustomobject]@{ Status='UNLISTED'; Target=''; Sha256=''
+    return [pscustomobject]@{ Status='UNLISTED'; Target=''
         Detail="NATS $Installed is not on Veeam's supported list, and Veeam lists no newer $line version to update to. Left alone: moving to another line is an upgrade, which this script never does." }
 }
 
@@ -1355,21 +1464,23 @@ function Get-NatsDiscovery {
 
     $release = Get-Vb365ReleaseKey $Vb365Version
     $policy = Get-NatsPolicy
-    if (-not $release -or -not $policy.SupportedByVb365.ContainsKey($release)) {
-        $result.Status = 'POLICY_UNKNOWN_VB365'; $result.Detail = "This script has no NATS support list for VB365 $Vb365Version, so NATS $installed is left alone."
+    $list = Get-NatsSupportedVersions -ReleaseKey $release -Policy $policy
+    if (@($list.Versions).Count -eq 0) {
+        $result.Status = 'POLICY_UNKNOWN_VB365'; $result.Detail = "There is no NATS support list for VB365 $Vb365Version ($($list.Detail)), so NATS $installed is left alone."
         return [pscustomobject]$result
     }
-    $choice = Resolve-NatsTarget -Installed $installed -Supported $policy.SupportedByVb365[$release] -PackageSha256 $policy.PackageSha256
+    $choice = Resolve-NatsTarget -Installed $installed -Supported @($list.Versions)
     $result.Status = $choice.Status
     $result.Target = $choice.Target
-    $result.Detail = $choice.Detail
+    $listNote = " List: $($list.Detail)."
+    $result.Detail = "$($choice.Detail)$listNote"
     if ($choice.Status -ne 'UPDATE_AVAILABLE') { return [pscustomobject]$result }
 
     # An update is due. Prove everything the update and its rollback rely on, or refuse.
     $refuse = {
         param([string] $Why)
         $result.Status = 'UNRECOGNISED_LAYOUT'
-        $result.Detail = "NATS $installed -> $($choice.Target) is due, but $Why NATS is left alone."
+        $result.Detail = "NATS $installed -> $($choice.Target) is due, but $Why NATS is left alone.$listNote"
         return [pscustomobject]$result
     }
     if (-not (Test-Path -LiteralPath $image.ConfPath -PathType Leaf) -or (Test-PathTreeHasReparsePoint -Path $image.ConfPath)) {
@@ -1411,13 +1522,20 @@ function Get-NatsDiscovery {
     catch { return (& $refuse "its client connections could not be read: $($_.Exception.Message).") }
     if ($clients.RemoteAddresses.Count -gt 0) {
         $result.Status = 'REMOTE_CLIENTS'
-        $result.Detail = "NATS $installed -> $($choice.Target) is due, but other machines are connected to NATS ($($clients.RemoteAddresses -join ', ')). This profile updates a single-server NATS only, so NATS is left alone."
+        $result.Detail = "NATS $installed -> $($choice.Target) is due, but other machines are connected to NATS ($($clients.RemoteAddresses -join ', ')). This profile updates a single-server NATS only, so NATS is left alone.$listNote"
         return [pscustomobject]$result
     }
 
     if (-not $UpdatesEnabled) {
         $result.Status = 'UPDATES_OFF'
-        $result.Detail = "NATS $installed -> $($choice.Target) is due, but updateNats is false in the built-in settings, so -Install leaves NATS alone."
+        $result.Detail = "NATS $installed -> $($choice.Target) is due, but updateNats is false in the built-in settings, so -Install leaves NATS alone.$listNote"
+        return [pscustomobject]$result
+    }
+
+    $hash = Resolve-NatsPackageSha256 -Version $choice.Target -Policy $policy
+    if (-not $hash.Sha256) {
+        $result.Status = if ($hash.Source -eq 'Conflict') { 'HASH_CONFLICT' } else { 'HASH_UNAVAILABLE' }
+        $result.Detail = "NATS $installed -> $($choice.Target) is due, but $($hash.Detail). NATS is left alone.$listNote"
         return [pscustomobject]$result
     }
 
@@ -1426,7 +1544,8 @@ function Get-NatsDiscovery {
     $result.Plan = [pscustomobject][ordered]@{
         OldVersion             = $installed
         TargetVersion          = $choice.Target
-        TargetSha256           = $choice.Sha256
+        TargetSha256           = $hash.Sha256
+        HashSource             = $hash.Source
         OldImagePath           = "$($service.PathName)"
         OldExe                 = $image.Exe
         OldFolder              = $image.Folder
@@ -1449,7 +1568,7 @@ function Get-NatsDiscovery {
         StoreFiles             = 0
         StoreBytes             = [int64]0
     }
-    $result.Detail = "$($choice.Detail) Store $store; port $($facts.Port)."
+    $result.Detail = "$($choice.Detail)$listNote SHA256: $($hash.Detail). Store $store; port $($facts.Port)."
     return [pscustomobject]$result
 }
 
@@ -1685,14 +1804,15 @@ function Invoke-NatsOnlyUpdate {
     catch { Complete-Run $EXIT.DOWNLOAD 'NATS_DOWNLOAD_FAILED' "Could not download $natsZipUrl : $($_.Exception.Message)" }
     finally { $ProgressPreference = $oldProgress }
 
-    # NATS publishes no signature. The SHA256 pinned in Get-NatsPolicy is the proof.
+    # NATS publishes no signature. The download must match the SHA256 the audit step
+    # resolved: pinned in this script, or from the release's SHA256SUMS.
     $natsZipHash = ''
     try { $natsZipHash = Get-FileSha256 $natsZip } catch {}
     if ($natsZipHash -ne "$($natsPlan.TargetSha256)") {
         Remove-Item -LiteralPath $natsZip -Force -ErrorAction SilentlyContinue
-        Complete-Run $EXIT.DOWNLOAD 'NATS_HASH_MISMATCH' "The downloaded $natsZipName has SHA256 '$natsZipHash', not the pinned $($natsPlan.TargetSha256). It was deleted. Nothing was changed."
+        Complete-Run $EXIT.DOWNLOAD 'NATS_HASH_MISMATCH' "The downloaded $natsZipName has SHA256 '$natsZipHash', not the expected $($natsPlan.TargetSha256) ($($natsPlan.HashSource)). It was deleted. Nothing was changed."
     }
-    Write-Log "SHA256 matches the value pinned for NATS $natsTo" OK
+    Write-Log "SHA256 matches the expected value for NATS $natsTo ($($natsPlan.HashSource))" OK
 
     $natsStageDir = Join-Path $natsWork 'stage'
     try { $stagedExe = Expand-NatsPackage -ZipPath $natsZip -Version $natsTo -Destination $natsStageDir }
@@ -2519,6 +2639,14 @@ function Complete-Run {
     $script:Report.ExitCode = $finalCode
     if (-not $script:Report.IssueCode -and $finalCode -ne $EXIT.OK) { $script:Report.IssueCode = $Outcome }
     if (-not $script:Report.ActionRequired) { $script:Report.ActionRequired = Get-RmmActionForExitCode $finalCode }
+    # A NATS release that disagrees with the SHA256 built into this script may have
+    # been changed after it was published. NATS was left alone and the exit code
+    # stays as it is, but the RMM issue and action fields must say so.
+    if ($script:Report.Contains('NatsStatus') -and "$($script:Report['NatsStatus'])" -eq 'HASH_CONFLICT') {
+        if (-not $script:Report.IssueCode) { $script:Report.IssueCode = 'NATS_HASH_CONFLICT' }
+        $conflictAction = 'Investigate NatsStatus=HASH_CONFLICT: the NATS release on GitHub no longer matches the SHA256 built into this script, so NATS was left alone. See NatsDetail.'
+        $script:Report.ActionRequired = if ("$($script:Report.ActionRequired)" -eq 'None') { $conflictAction } else { "$($script:Report.ActionRequired) $conflictAction" }
+    }
     if (-not $script:Report.JobsLeftDisabled -and $finalCode -ge $EXIT.ESCALATE -and $script:DisabledJobs.Count -gt 0) {
         $script:Report.JobsLeftDisabled = (Get-UnrestoredJobNames -Records $script:DisabledJobs) -join ', '
     }

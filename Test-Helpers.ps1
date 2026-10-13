@@ -55,7 +55,8 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Read-NatsConfText','Get-NatsConfFacts','ConvertFrom-NatsConnectionString','ConvertFrom-NatsInfoLine','Get-NatsInfoVersion',
         'Wait-NatsInfoVersion','Get-NatsClientSummary','Test-NatsStorePathSafe','Test-NatsZipEntryNames','Expand-NatsPackage',
         'Get-FileSha256','Get-NatsDiscovery','Set-NatsStage','Set-NatsServicePath','Stop-ServiceAndWait','Test-NatsRunningAt',
-        'Restore-NatsStore','Restore-NatsInstallation','Get-NatsManualRevertAction','Stop-ServicesInOrder','Get-NatsRunFacts'
+        'Restore-NatsStore','Restore-NatsInstallation','Get-NatsManualRevertAction','Stop-ServicesInOrder','Get-NatsRunFacts',
+        'Invoke-NatsWebText','ConvertFrom-VeeamNatsRequirementsHtml','Get-NatsSupportedVersions','ConvertFrom-NatsSha256Sums','Resolve-NatsPackageSha256'
 foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($want -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -2397,7 +2398,7 @@ try {
 '--- NATS: same-line update policy (an update, never an upgrade) ---'
 $natsPolicy = Get-NatsPolicy
 $natsList = @($natsPolicy.SupportedByVb365['8.6'])
-function Get-TestNatsTarget([string] $Installed) { Resolve-NatsTarget -Installed $Installed -Supported $natsList -PackageSha256 $natsPolicy.PackageSha256 }
+function Get-TestNatsTarget([string] $Installed) { Resolve-NatsTarget -Installed $Installed -Supported $natsList }
 Check 'VB365 8.6 list is exact'              ($natsList -join ',') '2.10.18,2.10.22,2.10.28,2.12.5,2.12.8'
 Check 'every pinned package is on the list'  (@($natsPolicy.PackageSha256.Keys | Where-Object { $natsList -notcontains $_ }).Count) 0
 Check 'pinned hashes are SHA256 hex'         (@($natsPolicy.PackageSha256.Values | Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }).Count) 0
@@ -2405,7 +2406,6 @@ Check '2.10.28 hash is the published one'    $natsPolicy.PackageSha256['2.10.28'
 Check '2.12.8 hash is the published one'     $natsPolicy.PackageSha256['2.12.8'] '61836ff8d0cecbb773faf7daa22f5212b7ed3ab5a0c58c12b013d67d64edd6cc'
 $t = Get-TestNatsTarget '2.10.18'; Check '2.10.18 -> 2.10.28'               "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.10.28'
 $t = Get-TestNatsTarget '2.10.22'; Check '2.10.22 -> 2.10.28'               "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.10.28'
-Check '2.10.22 gets the pinned hash'         (Get-TestNatsTarget '2.10.22').Sha256 $natsPolicy.PackageSha256['2.10.28']
 $t = Get-TestNatsTarget '2.10.28'; Check '2.10.28 is current, never 2.12'   "$($t.Status)|$($t.Target)" 'CURRENT|'
 $t = Get-TestNatsTarget '2.10.29'; Check '2.10.29 is ahead, never downgraded' "$($t.Status)|$($t.Target)" 'AHEAD|'
 $t = Get-TestNatsTarget '2.12.5';  Check '2.12.5 -> 2.12.8'                 "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.12.8'
@@ -2414,8 +2414,8 @@ $t = Get-TestNatsTarget '2.12.8';  Check '2.12.8 is current'                $t.S
 $t = Get-TestNatsTarget '2.12.9';  Check '2.12.9 is ahead'                  $t.Status 'AHEAD'
 $t = Get-TestNatsTarget '2.11.4';  Check '2.11.4 has no line to update on'  "$($t.Status)|$($t.Target)" 'UNLISTED|'
 $t = Get-TestNatsTarget '2.14.0';  Check '2.14.0 is left alone'             "$($t.Status)|$($t.Target)" 'UNLISTED|'
-$t = Resolve-NatsTarget -Installed '2.10.22' -Supported @('2.10.22','2.10.30') -PackageSha256 @{}
-Check 'listed but unpinned is never installed' "$($t.Status) $($t.Target) [$($t.Sha256)]" 'UNPINNED 2.10.30 []'
+$t = Resolve-NatsTarget -Installed '2.10.22' -Supported @('2.10.22','2.10.30')
+Check 'a version Veeam adds becomes the target' "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.10.30'
 $crossLine = @(foreach ($v in @('2.10.18','2.10.22','2.10.28','2.10.29','2.11.0','2.12.5','2.12.6','2.12.7','2.12.8','2.14.1')) {
     $r = Get-TestNatsTarget $v
     if ($r.Target -and (([version]$r.Target).Major -ne ([version]$v).Major -or ([version]$r.Target).Minor -ne ([version]$v).Minor)) { $v }
@@ -2424,8 +2424,9 @@ $crossLine = @(foreach ($v in @('2.10.18','2.10.22','2.10.28','2.10.29','2.11.0'
 Check 'no version moves to another line or down' ($crossLine -join ',') ''
 Check 'VB365 8.6 file version maps to 8.6'   (Get-Vb365ReleaseKey '13.6.0.0') '8.6'
 Check 'VB365 8.6 build number maps to 8.6'   (Get-Vb365ReleaseKey '8.6.0.1102') '8.6'
-Check 'a later VB365 has no list yet'        (Get-Vb365ReleaseKey '13.7.0.0') ''
-Check '13.60 is not 13.6'                    (Get-Vb365ReleaseKey '13.60.0.0') ''
+Check 'a later VB365 maps to its own release' (Get-Vb365ReleaseKey '13.7.0.0') '8.7'
+Check '13.60 is not 13.6'                    (Get-Vb365ReleaseKey '13.60.0.0') '8.60'
+Check 'VB365 7 has no NATS release key'      (Get-Vb365ReleaseKey '7.1.0.1413') ''
 Check 'unknown VB365 version has no list'    (Get-Vb365ReleaseKey 'Unknown') ''
 
 '--- NATS: service command line ---'
@@ -2537,6 +2538,114 @@ try {
 }
 Check 'nothing listening gives no version' (Get-NatsInfoVersion -HostName '127.0.0.1' -Port $infoPort -TimeoutMs 1000) ''
 
+'--- NATS: the supported list is read from the Veeam website ---'
+$veeamPage = @'
+<html><head><title>System Requirements</title></head><body>
+<nav>Step 9. Configure NATS Server Step 10. Begin Installation</nav>
+<table><tr><td>NATS</td><td><p>Local or remote installation of the NATS server 2.10.18, 2.10.22, 2.10.28, 2.12.5, 2.12.8.</p>
+<p>Note: If you plan to use the NATS server other than the version included in the setup, you must install and maintain it yourself.</p></td></tr></table>
+<div class="footer">Page updated 2026-09-04 Page content applies to build&nbsp;8.6.0.1102</div></body></html>
+'@
+$parsedPage = ConvertFrom-VeeamNatsRequirementsHtml $veeamPage
+Check 'page build read'                ($parsedPage.Build) '8.6.0.1102'
+Check 'page release read'              ($parsedPage.Release) '8.6'
+Check 'page NATS list read'            ($parsedPage.Versions -join ',') '2.10.18,2.10.22,2.10.28,2.12.5,2.12.8'
+$pageAnd = $veeamPage -replace '2\.12\.5, 2\.12\.8\.', '2.12.8, 2.12.10 and 2.12.9.'
+Check 'a list with "and" is read in version order' ((ConvertFrom-VeeamNatsRequirementsHtml $pageAnd).Versions -join ',') '2.10.18,2.10.22,2.10.28,2.12.8,2.12.9,2.12.10'
+Check 'no build named is refused'      (Throws { ConvertFrom-VeeamNatsRequirementsHtml ($veeamPage -replace 'Page content applies to build', 'Built for') }) 'True'
+Check 'two builds named are refused'   (Throws { ConvertFrom-VeeamNatsRequirementsHtml ($veeamPage + '<p>Page content applies to build 8.7.0.100</p>') }) 'True'
+Check 'no NATS list is refused'        (Throws { ConvertFrom-VeeamNatsRequirementsHtml ($veeamPage -replace 'NATS server 2', 'NATS release 2') }) 'True'
+Check 'two different lists are refused' (Throws { ConvertFrom-VeeamNatsRequirementsHtml ($veeamPage + '<p>the NATS server 2.14.1</p>') }) 'True'
+# Any other wording is refused, never read as a shorter list (review finding).
+$enDash = [string][char]0x2013
+foreach ($case in @(
+    @{ Name='a range with a dash';       Page=($veeamPage -replace '2\.12\.5, 2\.12\.8', "2.12.5${enDash}2.12.8") },
+    @{ Name='an ampersand separator';    Page=($veeamPage -replace '2\.12\.5, 2\.12\.8', '2.12.5 &amp; 2.12.8') },
+    @{ Name='a semicolon separator';     Page=($veeamPage -replace '2\.10\.28, 2\.12\.5', '2.10.28; 2.12.5') },
+    @{ Name='a bullet list';             Page=($veeamPage -replace 'NATS server 2\.10\.18, 2\.10\.22, 2\.10\.28, 2\.12\.5, 2\.12\.8\.', 'NATS server</p><ul><li>2.10.18</li><li>2.10.22</li><li>2.12.8</li></ul><p>.') },
+    @{ Name='a "from ... to" range';     Page=($veeamPage -replace '2\.10\.18, 2\.10\.22, 2\.10\.28', '2.10.18 to 2.10.28') },
+    @{ Name='a note after the list';     Page=($veeamPage -replace '2\.12\.8\.', '2.12.8, 2.12.10 (starting from build 8.6.1.20).') })) {
+    Check "page wording refused: $($case.Name)" (Throws { ConvertFrom-VeeamNatsRequirementsHtml $case.Page }) 'True'
+}
+Check 'a list at the end of the text is read' ((ConvertFrom-VeeamNatsRequirementsHtml '<p>Page content applies to build 8.6.0.1102</p><p>NATS server 2.10.28 or 2.12.8</p>').Versions -join ',') '2.10.28,2.12.8'
+
+# Windows PowerShell 5.1 decodes a page served without a charset as ISO-8859-1. The
+# raw bytes are decoded as UTF-8 instead, so a no-break space stays one character.
+& {
+    $nbsp = [string][char]0x00A0
+    $utf8Bytes = [Text.Encoding]::UTF8.GetBytes("NATS server${nbsp}2.10.28.")
+    function Invoke-WebRequest {
+        [CmdletBinding()] param($Uri, [switch] $UseBasicParsing, $TimeoutSec)
+        if ($script:FakeWebMode -eq 'Stream') {
+            [pscustomobject]@{ RawContentStream = (New-Object IO.MemoryStream (,$utf8Bytes)); Content = [Text.Encoding]::GetEncoding(28591).GetString($utf8Bytes) }
+        } else {
+            [pscustomobject]@{ Content = $utf8Bytes }
+        }
+    }
+    $script:FakeWebMode = 'Stream'
+    Check 'web text is decoded as UTF-8'      (Invoke-NatsWebText -Uri 'https://example.invalid/') "NATS server${nbsp}2.10.28."
+    $script:FakeWebMode = 'Bytes'
+    Check 'downloaded bytes are decoded too'  (Invoke-NatsWebText -Uri 'https://example.invalid/') "NATS server${nbsp}2.10.28."
+}
+
+$sums = "0000000000000000000000000000000000000000000000000000000000000001  nats-server-v2.12.9-linux-amd64.tar.gz`n" +
+        "ABCDEF0000000000000000000000000000000000000000000000000000000002 *nats-server-v2.12.9-windows-amd64.zip`n" +
+        "0000000000000000000000000000000000000000000000000000000000000003  nats-server-v2.12.9-windows-arm64.zip`n"
+Check 'SHA256SUMS line for the Windows zip' (ConvertFrom-NatsSha256Sums -Text $sums -Version '2.12.9') 'abcdef0000000000000000000000000000000000000000000000000000000002'
+Check 'no line for that version is no hash' (ConvertFrom-NatsSha256Sums -Text $sums -Version '2.12.8') ''
+Check 'two different lines are no hash' (ConvertFrom-NatsSha256Sums -Text ($sums + "1111111111111111111111111111111111111111111111111111111111111111  nats-server-v2.12.9-windows-amd64.zip") -Version '2.12.9') ''
+
+& {
+    function Invoke-NatsWebText {
+        param([string] $Uri, [int] $TimeoutSec)
+        $script:WebAsked += $Uri
+        if ($Uri -match 'helpcenter\.veeam\.com') { if ($script:FakePage) { return $script:FakePage }; throw 'The remote name could not be resolved' }
+        if ($Uri -match '/v(\d+\.\d+\.\d+)/SHA256SUMS$' -and $script:FakeSums.ContainsKey($Matches[1])) { return $script:FakeSums[$Matches[1]] }
+        throw 'Response status code does not indicate success: 404 (Not Found).'
+    }
+    $policy = Get-NatsPolicy
+    $script:WebAsked = @(); $script:FakeSums = @{}
+
+    $script:FakePage = $veeamPage
+    $l = Get-NatsSupportedVersions -ReleaseKey '8.6' -Policy $policy
+    Check "Veeam's page is used for its own release" "$($l.Source) $(@($l.Versions).Count)" 'Veeam 5'
+    Check "the page asked is Veeam's requirements page" ($script:WebAsked[-1]) 'https://helpcenter.veeam.com/docs/vbo365/guide/vbo_system_requirements.html'
+    $script:FakePage = $veeamPage -replace '2\.12\.8\.', '2.12.8, 2.12.9.'
+    Check 'a version Veeam adds is picked up' ((Get-NatsSupportedVersions -ReleaseKey '8.6' -Policy $policy).Versions -join ',') '2.10.18,2.10.22,2.10.28,2.12.5,2.12.8,2.12.9'
+    $script:FakePage = $veeamPage -replace '8\.6\.0\.1102', '8.7.0.100'
+    $l = Get-NatsSupportedVersions -ReleaseKey '8.6' -Policy $policy
+    Check 'a page for another release is not used' "$($l.Source) $($l.Detail -match 'describes VB365 8\.7')" 'BuiltIn True'
+    $l = Get-NatsSupportedVersions -ReleaseKey '8.7' -Policy $policy
+    Check 'a newer release than the server knows has its list' "$($l.Source) $(@($l.Versions).Count)" 'Veeam 5'
+    $script:FakePage = $null
+    $l = Get-NatsSupportedVersions -ReleaseKey '8.6' -Policy $policy
+    Check 'offline: the built-in list is used' "$($l.Source) $($l.Detail -match 'could not be read')" 'BuiltIn True'
+    $l = Get-NatsSupportedVersions -ReleaseKey '8.7' -Policy $policy
+    Check 'offline with no built-in list: none' "$($l.Source) $(@($l.Versions).Count)" 'None 0'
+    $script:FakePage = $veeamPage + '<p>the NATS server 2.14.1</p>'
+    Check 'an unreadable page falls back' ((Get-NatsSupportedVersions -ReleaseKey '8.6' -Policy $policy).Source) 'BuiltIn'
+    $script:FakePage = $veeamPage
+    Check 'an unknown release is never matched' ((Get-NatsSupportedVersions -ReleaseKey '' -Policy $policy).Source) 'None'
+
+    $pin = $policy.PackageSha256['2.10.28']
+    $script:FakeSums = @{ '2.10.28' = "$pin  nats-server-v2.10.28-windows-amd64.zip" }
+    $h = Resolve-NatsPackageSha256 -Version '2.10.28' -Policy $policy
+    Check 'pinned and published agree'     "$($h.Source) $($h.Sha256 -eq $pin) $($h.Detail -match 'matching')" 'Pinned True True'
+    $script:FakeSums = @{}
+    $h = Resolve-NatsPackageSha256 -Version '2.10.28' -Policy $policy
+    Check 'pinned, published unreadable'   "$($h.Source) $($h.Sha256 -eq $pin)" 'Pinned True'
+    $script:FakeSums = @{ '2.10.28' = ('f' * 64) + '  nats-server-v2.10.28-windows-amd64.zip' }
+    $h = Resolve-NatsPackageSha256 -Version '2.10.28' -Policy $policy
+    Check 'pinned and published differ: no hash' "$($h.Source) [$($h.Sha256)] $($h.Detail -match 'changed after it was published')" 'Conflict [] True'
+    $script:FakeSums = @{ '2.12.9' = ('a' * 64) + '  nats-server-v2.12.9-windows-amd64.zip' }
+    $h = Resolve-NatsPackageSha256 -Version '2.12.9' -Policy $policy
+    Check 'a new version uses the published hash' "$($h.Source) $($h.Sha256 -eq ('a' * 64))" 'SHA256SUMS True'
+    Check 'the hash comes from that release' ($script:WebAsked[-1]) 'https://github.com/nats-io/nats-server/releases/download/v2.12.9/SHA256SUMS'
+    $script:FakeSums = @{}
+    $h = Resolve-NatsPackageSha256 -Version '2.12.9' -Policy $policy
+    Check 'a new version without a readable hash: none' "$($h.Source) [$($h.Sha256)]" 'None []'
+}
+
 '--- NATS: client connections ---'
 & {
     function Get-NetTCPConnection {
@@ -2645,6 +2754,13 @@ Check 'the NATS program folder is not' (Test-NatsStorePathSafe -StoreDir 'C:\Pro
         function Invoke-Native { param([string] $FilePath, [string[]] $Arguments) $script:NativeCalls += "$FilePath $($Arguments -join ' ')"; [pscustomobject]@{ ExitCode=0; StdOut="nats-server: v$($script:FakeExeVersion)"; StdErr='' } }
         function Get-NatsInfoVersion { param($HostName, $Port, $TimeoutMs) $script:InfoAsked = "${HostName}:$Port"; $script:FakeInfo }
         function Get-NatsClientSummary { param($Port) [pscustomobject]@{ RemoteAddresses=@($script:FakeRemote); Vb365Processes=@('Veeam.Archiver.Service') } }
+        function Invoke-NatsWebText {
+            param([string] $Uri, [int] $TimeoutSec)
+            if ($Uri -match 'helpcenter\.veeam\.com' -and $script:FakePage) { return $script:FakePage }
+            if ($Uri -match '/v(\d+\.\d+\.\d+)/SHA256SUMS$' -and $script:FakeSums.ContainsKey($Matches[1])) { return $script:FakeSums[$Matches[1]] }
+            throw 'offline'
+        }
+        $script:FakePage = $null; $script:FakeSums = @{}
         $cfgXml = [xml]'<Config><Server JetStreamConnectionString="nats://admin:SecretPw==@localhost:4222?passwordEncrypted" JetStreamReplicaCount="3"/></Config>'
         $proxyXmlD = [xml]'<Proxy><Proxy JetStreamConnectionString="nats://admin:SecretPw==@localhost:4222?passwordEncrypted"/></Proxy>'
         function Find-TestNats {
@@ -2666,6 +2782,8 @@ Check 'the NATS program folder is not' (Test-NatsStorePathSafe -StoreDir 'C:\Pro
         Check 'plan: store from the config file' $d.Plan.StoreDir $storeD
         Check 'plan: port'                       $d.Plan.Port 4222
         Check 'plan: pinned hash'                $d.Plan.TargetSha256 '98b8571231b00ebe0445cc7f317f6425c1fbc2edecd455949d37022e04281657'
+        Check 'plan: hash source'                $d.Plan.HashSource 'Pinned'
+        Check 'offline: the built-in list is named' ($d.Detail -match 'list built into this script') 'True'
         Check 'plan: VB365 was connected'        $d.Plan.BaselineVb365Connected 'True'
         Check 'version asked where NATS listens' $script:InfoAsked '127.0.0.1:4222'
         Check 'only --version is run'            ($script:NativeCalls -join ';') "$(Join-Path $oldDir 'nats-server.exe') --version"
@@ -2687,6 +2805,7 @@ Check 'the NATS program folder is not' (Test-NatsStorePathSafe -StoreDir 'C:\Pro
         Check 'updateNats false only reports'    "$($d.Status) $($d.Target) $($null -eq $d.Plan)" 'UPDATES_OFF 2.10.28 True'
         $d = Find-TestNats -Remote @('10.9.9.9')
         Check 'other machines connected'         "$($d.Status) $($null -eq $d.Plan)" 'REMOTE_CLIENTS True'
+        Check 'a refusal still names the list used' ($d.Detail -match 'List: the list built into this script') 'True'
         $d = Find-TestNats -Info '2.10.18'
         Check 'NATS answers another version'     ($d.Status -eq 'UNRECOGNISED_LAYOUT' -and $d.Detail -match 'answered version 2\.10\.18') 'True'
         $d = Find-TestNats -Cfg ([xml]'<Config><Server JetStreamConnectionString="nats://admin:SecretPw==@nats-elsewhere.example:4222"/></Config>')
@@ -2709,6 +2828,26 @@ Check 'the NATS program folder is not' (Test-NatsStorePathSafe -StoreDir 'C:\Pro
         $d = Find-TestNats -WorkRootD $storeD
         Check 'store overlapping WorkRoot refused' ($d.Detail -match 'overlaps') 'True'
         Check 'refusals carry no plan'           ($null -eq $d.Plan) 'True'
+
+        # Veeam's website adds 2.12.9 and GitHub publishes its hash: no script change.
+        $script:FakePage = $veeamPage -replace '2\.12\.8\.', '2.12.8, 2.12.9.'
+        $script:FakeSums = @{ '2.12.9' = ('b' * 64) + '  nats-server-v2.12.9-windows-amd64.zip' }
+        $d = Find-TestNats -Version '2.12.8' -Exe (Join-Path $plainDir 'nats-server.exe')
+        Check 'a newly listed version is planned' "$($d.Status) $($d.Target) $($d.Plan.HashSource)" 'UPDATE_AVAILABLE 2.12.9 SHA256SUMS'
+        Check 'its published hash is planned'    ($d.Plan.TargetSha256 -eq ('b' * 64)) 'True'
+        Check "Veeam's list is named"            ($d.Detail -match "Veeam's current list for VB365 build 8\.6\.0\.1102") 'True'
+        $script:FakeSums = @{}
+        $d = Find-TestNats -Version '2.12.8' -Exe (Join-Path $plainDir 'nats-server.exe')
+        Check 'no readable hash: left alone'      "$($d.Status) $($null -eq $d.Plan)" 'HASH_UNAVAILABLE True'
+        $script:FakeSums = @{ '2.10.28' = ('c' * 64) + '  nats-server-v2.10.28-windows-amd64.zip' }
+        $d = Find-TestNats
+        Check 'pinned and published differ: left alone' "$($d.Status) $($null -eq $d.Plan)" 'HASH_CONFLICT True'
+        $script:FakePage = $veeamPage -replace '8\.6\.0\.1102', '8.7.0.100'; $script:FakeSums = @{}
+        $d = Find-TestNats -Version '2.12.8' -Exe (Join-Path $plainDir 'nats-server.exe')
+        Check 'a page for VB365 8.7 is not used on 8.6' "$($d.Status) $($d.Detail -match 'describes VB365 8\.7')" 'CURRENT True'
+        $d = Find-TestNats -Vb365 '13.7.0.0' -Version '2.12.8' -Exe (Join-Path $plainDir 'nats-server.exe')
+        Check 'a VB365 8.7 server uses the 8.7 page' "$($d.Status) $($d.Detail -match 'build 8\.7\.0\.100')" 'CURRENT True'
+        $script:FakePage = $null
     } finally {
         Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -3095,6 +3234,8 @@ Check 'the service is never edited in the registry' ($scriptText -match 'Set-Ite
 $rollbackText = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-Rollback' }, $true))[0].Extent.Text
 Check 'rollback puts NATS back before starting it' ($rollbackText.IndexOf('Restore-NatsInstallation') -ge 0 -and $rollbackText.IndexOf('Restore-NatsInstallation') -lt $rollbackText.IndexOf("Start-Service -Name 'nats-server'")) 'True'
 Check 'the report has the NATS fields'         ($scriptText -match "(?m)^\s+NatsInstalled\s+= ''" -and $scriptText -match "(?m)^\s+NatsTarget\s+= ''" -and $scriptText -match "(?m)^\s+NatsStatus\s+= ''" -and $scriptText -match "(?m)^\s+NatsDetail\s+= ''") 'True'
+$completeRunText = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Complete-Run' }, $true))[0].Extent.Text
+Check 'a hash conflict reaches the RMM issue fields' ($completeRunText -match "'HASH_CONFLICT'" -and $completeRunText -match "IssueCode = 'NATS_HASH_CONFLICT'" -and $completeRunText.IndexOf("'NATS_HASH_CONFLICT'") -gt $completeRunText.IndexOf('$script:Report.ActionRequired = Get-RmmActionForExitCode $finalCode')) 'True'
 Check 'a pending NATS update keeps exit 5 after a booked restart' ($scriptText -match '\$bookedCode = Get-PolicyExitCode -Eol \$script:EolBranch -UpdateAvailable \$natsDue -RebootRequired \$false') 'True'
 
 '--- Get-CfgValue StrictMode safety ---'

@@ -170,12 +170,17 @@ exact values:
 | `10` | Safe transient condition | Retry later; no backup or restore was forcibly stopped |
 | `11` | Unsupported or excluded topology | Handle manually; do not repeatedly retry as a transient failure |
 | `20` | Pre-flight failed | Investigate before retrying |
-| `30` | EnterpriseDB page, download, size, or signature check failed, or the NATS download or its pinned SHA256 check failed | Investigate the download path; nothing was installed |
+| `30` | EnterpriseDB page, download, size, or signature check failed, or the NATS download or its SHA256 check failed | Investigate the download path; nothing was installed |
 | `40` | **Post-change failure, unhealthy service, mandatory tuning failure, or recovery needs an operator** | **Page an operator and read the RMM issue fields** |
 | `50` | **PostgreSQL is missing, down, unqueryable, or reports the wrong version after change/tuning/recovery diagnosis** | **Page an operator immediately and use the recovery evidence** |
 
 Failure codes `20`–`50` take precedence over informational EOL/reboot codes. For example,
 an EOL server with a post-update service failure returns `40`, not `8`.
+
+The exit code follows PostgreSQL. A run can return `0` (or `5`, `7`, `9`) while NATS was
+left alone for a reason worth a look. Alert on `NatsStatus` too: `HASH_CONFLICT` above all
+(it also fills `IssueCode` and `ActionRequired`), and also `REMOTE_CLIENTS` and
+`UNRECOGNISED_LAYOUT`.
 
 The console summary and `last-result.json` include `ExitCode`, `IssueCode`,
 `ActionRequired`, `JobsLeftDisabled`, `UnhealthyServices`, `ServicesStarted`,
@@ -211,7 +216,7 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | `-RebootDelaySeconds` | `120` | Seconds from booking the restart to Windows restarting, 30 to 3600. Only used with `-Reboot` |
 | `-Recover` | off | Restore captured state from an interrupted run; if the installer finished and PostgreSQL proves healthy at the target version, finish the run |
 | `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
-| `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed |
+| `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed and, on VB365, Veeam's help center (and GitHub when a NATS update is due) |
 | `-RemoveStaleEnterpriseManagerRecord` | off | Delete a proven-stale `Veeam Backup Reporting` registry key, after exporting and verifying a `.reg` backup |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
@@ -462,7 +467,20 @@ The script moves NATS only to the newest version on that list that is on the **s
 as the installed one. A move to another line changes the message-store format and has no
 documented way back, so the script never does it.
 
-For VB365 8.6 the list is 2.10.18, 2.10.22, 2.10.28, 2.12.5 and 2.12.8:
+**The list is read from Veeam's website on every run**, so a version Veeam adds is picked up
+without a script change. The script uses the page only when it describes the server's own
+VB365 release: the page says "Page content applies to build 8.6.0.1102", and that must be
+8.6 on an 8.6 server. Veeam's page always shows the newest VB365 release, so after Veeam
+ships 8.7, an 8.6 server falls back to the 8.6 list built into the script. The same happens
+when the page cannot be read, or when its NATS sentence no longer reads as one plain list
+("NATS server" followed by versions separated by commas, "and" or "or", ending in a full
+stop). Then nothing from the page is used. `NatsDetail` names the list used.
+
+Only 8.6 has a list built in. A server on another release gets NATS updates only while
+Veeam's page describes that release and can be read. Otherwise it reports
+`POLICY_UNKNOWN_VB365` until its list is added to `SupportedByVb365` in `Get-NatsPolicy`.
+
+For VB365 8.6 the list is 2.10.18, 2.10.22, 2.10.28, 2.12.5 and 2.12.8 (October 2026):
 
 | Installed | Result |
 |---|---|
@@ -476,15 +494,17 @@ For VB365 8.6 the list is 2.10.18, 2.10.22, 2.10.28, 2.12.5 and 2.12.8:
 and reports `NatsStatus=UPDATE_PENDING`. The next `-Install` run updates NATS. Each change
 then has its own outage and its own rollback, and you always know which one caused a problem.
 
-**The download is checked against a pinned SHA256.** NATS publishes no signature. The script
-holds the SHA256 of every package it may install, in `Get-NatsPolicy`. A download that does
-not match is deleted, and the run returns exit `30` with nothing changed.
+**The download is checked against a SHA256.** NATS publishes no signature. Each
+[NATS release](https://github.com/nats-io/nats-server/releases) has a `SHA256SUMS` file, and
+the download must match the line for its `windows-amd64.zip`. A download that does not match
+is deleted, and the run returns exit `30` with nothing changed.
 
-**When Veeam lists a new NATS version**, add it to `Get-NatsPolicy` in the script: the
-version to the VB365 release's list, and the SHA256 of its `windows-amd64.zip` from the
-release's `SHA256SUMS` file on [GitHub](https://github.com/nats-io/nats-server/releases).
-A version on the list without a hash is reported as `UNPINNED` and never installed. A newer
-VB365 release gets no NATS changes until its list is added.
+That file comes from the same GitHub release as the download. It proves the file arrived
+whole, but not that the release itself is genuine: GitHub lets a release be changed after it
+is published. For the versions known when the script was written (2.10.28 and 2.12.8), the
+script also has the SHA256 built in, in `Get-NatsPolicy`. If the release's `SHA256SUMS` ever
+disagrees with it, the script installs nothing (`HASH_CONFLICT`). A version Veeam adds later
+is checked against `SHA256SUMS` only. That is the trade-off for not editing the script.
 
 ### What a NATS update does
 
@@ -555,8 +575,9 @@ recover one instead of guessing.
 | `NOT_UPDATED` | The run stopped before NATS was changed |
 | `UPDATE_FAILED` | The run stopped while NATS was half-switched. Read `ActionRequired` |
 | `AHEAD` / `UNLISTED` | Not on Veeam's list, or nothing on its line to update to. Left alone |
-| `UNPINNED` | Veeam lists a newer version, but the script has no hash for it yet |
-| `POLICY_UNKNOWN_VB365` | The script has no NATS list for this VB365 release |
+| `HASH_UNAVAILABLE` | Due, but the release's `SHA256SUMS` could not be read (for example a proxy blocks `github.com` or `release-assets.githubusercontent.com`), and no SHA256 is built in. Each run checks again |
+| `HASH_CONFLICT` | Due, but the release's `SHA256SUMS` disagrees with the SHA256 built into the script. The release may have been changed. Investigate before anything else. The exit code does not change, but `IssueCode` and `ActionRequired` say so |
+| `POLICY_UNKNOWN_VB365` | No NATS list for this VB365 release: the server's release could not be identified, or Veeam's page could not be read or describes another release, and the script has none built in. `NatsDetail` says which |
 | `REMOTE_CLIENTS` | Another machine is connected to NATS |
 | `UNRECOGNISED_LAYOUT` | NATS is not set up the way the script expects. `NatsDetail` says what |
 
@@ -868,9 +889,14 @@ tested profile that protects every database, proxy, service, and schedule involv
 
 * **No checksums.** EnterpriseDB publishes none. The Authenticode signature is the only
   authenticity control. Behind a TLS-inspecting proxy, test it before fleet rollout.
-* **NATS has no signature.** The pinned SHA256 is the only authenticity control, so a new
-  NATS version needs a script change. NATS updates cover a single-server NATS only: no
-  cluster, gateway, leaf node, or client on another machine.
+* **NATS has no signature.** A NATS version Veeam adds later is checked only against the
+  `SHA256SUMS` file in its own GitHub release, so a release changed after publication would
+  not be caught. Only 2.10.28 and 2.12.8 also have a SHA256 built into the script.
+* **More sites to reach on VB365.** Every run, audit included, reads
+  `helpcenter.veeam.com`. When a NATS update is due it also reads the release's
+  `SHA256SUMS` from `github.com`, which redirects to `release-assets.githubusercontent.com`.
+  The `-Install` download of NATS uses the same two GitHub hosts.
+* **Single-server NATS only.** No cluster, gateway, leaf node, or client on another machine.
 * **Pilot first.** VB365 support needs VB365 8.6 or later. The unit tests pass on both
   PowerShell editions. **Pilot each new product, version and PowerShell edition on one
   non-production server before fleet rollout.**
