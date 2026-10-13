@@ -2036,7 +2036,11 @@ function Get-ActiveLabelsFromSessions {
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Sessions,
         [Parameter(Mandatory)][string] $Prefix,
-        [switch] $AssumeReturnedActive
+        [switch] $AssumeReturnedActive,
+        # States that mean "ended" for THIS caller's product only. VB365 marks a job
+        # session that was cut off as Disconnected and never resumes it, while VBR
+        # uses Disconnected for live work, so it stays active everywhere else.
+        [string[]] $EndedStates = @()
     )
     $labels = @()
     # Idle means no I/O between scheduled runs; ActionRequired is a stopped
@@ -2059,13 +2063,40 @@ function Get-ActiveLabelsFromSessions {
             if ($AssumeReturnedActive) { $labels += "${Prefix}:Active"; continue }
             throw [System.NotSupportedException]::new("$Prefix session has no readable State or Status property")
         }
-        if ($terminal -contains $state) { continue }
+        if ($terminal -contains $state -or $EndedStates -contains $state) { continue }
         if ($activeStates -notcontains $state) {
             throw [System.NotSupportedException]::new("$Prefix returned unknown session state '$state'; refusing to assume the server is idle")
         }
         $labels += "${Prefix}:$state"
     }
     return $labels
+}
+
+# True when a Queued VB365 organisation sync is due to start: its ScheduledTime has
+# passed, falls within the guard window, or cannot be read. Veeam documents Queued
+# with a later ScheduledTime as the normal state between syncs. A time with no zone
+# is read both as UTC and as local time, and the earlier reading wins, so a wrong
+# guess makes the run wait rather than miss a sync. A sync that starts later is
+# still caught by the activity read just before services stop.
+function Test-Vb365QueuedSyncDue {
+    param(
+        [Parameter(Mandatory)] $CurrentState,
+        [int] $GuardMinutes = 15,
+        [datetime] $NowUtc = [datetime]::UtcNow
+    )
+    if ($CurrentState.PSObject.Properties.Name -notcontains 'ScheduledTime') { return $true }
+    $scheduled = $CurrentState.ScheduledTime
+    if ($scheduled -is [DateTimeOffset]) { $scheduled = $scheduled.UtcDateTime }
+    if ($scheduled -isnot [datetime] -or $scheduled.Year -le 1900) { return $true }
+    $limit = $NowUtc.AddMinutes($GuardMinutes)
+    $readings = if ($scheduled.Kind -eq [DateTimeKind]::Unspecified) {
+        @([datetime]::SpecifyKind($scheduled, [DateTimeKind]::Utc),
+          [datetime]::SpecifyKind($scheduled, [DateTimeKind]::Local).ToUniversalTime())
+    } else {
+        @($scheduled.ToUniversalTime())
+    }
+    foreach ($reading in $readings) { if ($reading -le $limit) { return $true } }
+    return $false
 }
 
 function Get-ActiveVb365OrganizationSyncWork {
@@ -2122,6 +2153,9 @@ function Get-ActiveVb365OrganizationSyncWork {
             if ($status -notin @('Queued','Running')) {
                 throw [System.NotSupportedException]::new("VB365 organization '$organizationLabel' $($current.Scope) synchronization returned unknown current status '$status'")
             }
+            # Queued is VB365's resting state between its daily syncs: it only books
+            # the next one. Wait only when that sync is due, or its time is unreadable.
+            if ($status -eq 'Queued' -and -not (Test-Vb365QueuedSyncDue -CurrentState $current.Value)) { continue }
             $labels += "VB365:OrganizationSync:${organizationLabel}:$($current.Scope):$status"
         }
     }
@@ -2641,7 +2675,10 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new("$required is unavailable, so VB365 activity cannot be checked safely")
             }
         }
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBOJobSession') -Prefix 'VB365:Job')
+        # Get-VBOJobSession returns every session ever recorded. A session that was
+        # cut off ends as Disconnected and is never resumed, so an old one must not
+        # hold the update forever. Running, Queued and Updating still count.
+        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBOJobSession') -Prefix 'VB365:Job' -EndedStates @('Disconnected'))
         # This cmdlet returns only the requested active restore sessions.
         try { $vboRestoreSessions = @(Get-VBORestoreSession -Status Running -ErrorAction Stop) }
         catch { throw "Get-VBORestoreSession -Status Running failed: $($_.Exception.Message)" }
@@ -2654,7 +2691,9 @@ function Get-ActiveVeeamWork {
         foreach ($commandName in @('Get-VBODataRetrievalSession','Get-VBODataManagementSession',
                                     'Get-VBORepositorySynchronizeSession','Get-VBORepositoryUpgradeSession')) {
             if (Get-Command $commandName -ErrorAction SilentlyContinue) {
-                $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VB365:$commandName")
+                # Data-retrieval sessions use the same status values as job sessions.
+                $vboEnded = if ($commandName -eq 'Get-VBODataRetrievalSession') { @('Disconnected') } else { @() }
+                $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter $commandName) -Prefix "VB365:$commandName" -EndedStates $vboEnded)
             }
         }
         foreach ($commandName in @('Get-VBOExchangeItemRestoreSession','Get-VBOSharePointItemRestoreSession','Get-VBOTeamsItemRestoreSession')) {

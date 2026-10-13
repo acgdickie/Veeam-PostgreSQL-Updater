@@ -314,7 +314,11 @@ or a job cannot be identified and later re-enabled by stable ID, the run fails c
 Protection-group rescans and their agent deployment work are checked through current and
 legacy VBR discovery-session types. VB365 whole-organization synchronization and each of
 its Users, Groups, GroupMembers, Sites, and Mailboxes parts are also fail-closed activity
-barriers because they write the PostgreSQL-backed organization cache.
+barriers because they write the PostgreSQL-backed organization cache. A sync that is only
+`Queued` for a later time is VB365's normal state between its daily syncs and does not
+hold the run; one that is running, overdue, due within 15 minutes, or has no readable
+time does. A VB365 job session that ended as `Disconnected` does not count as running,
+because VB365 never resumes it.
 
 If work is active, the script waits for it to finish naturally for up to
 `jobWaitTimeoutMinutes`. It does **not** forcibly stop or terminate backups, restores,

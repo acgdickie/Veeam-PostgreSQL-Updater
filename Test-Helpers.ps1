@@ -41,7 +41,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
         'Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
         'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById',
-        'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
+        'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Test-Vb365QueuedSyncDue','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier',
         'Get-UnrestoredJobNames',
         'Write-AtomicText','Write-AtomicJson','Set-RecoveryProperty','Save-RecoveryState',
@@ -741,11 +741,13 @@ $script:ManagedJobInventory = @()
 $script:FakeVboSessions = @((V 'Success'), (V 'Running'), (V 'Queued'), (V 'Updating'), (V 'Disconnected'), (V 'Stopped'))
 $script:FakeVboRestoreSessions = @((V 'Running'))
 $w = @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true)
-Check 'VB365 active jobs + restore -> 5'     $w.Count 5
+Check 'VB365 active jobs + restore -> 4'     $w.Count 4
 Check 'VB365 running label'                  ($w -contains 'VB365:Job:Running') 'True'
 Check 'VB365 queued label'                   ($w -contains 'VB365:Job:Queued') 'True'
 Check 'VB365 updating label'                 ($w -contains 'VB365:Job:Updating') 'True'
-Check 'VB365 disconnected label'             ($w -contains 'VB365:Job:Disconnected') 'True'
+# A VB365 job session that was cut off ends as Disconnected and is never resumed.
+# A run waited 12 hours on an old one while the job was not running at all.
+Check 'VB365 ended Disconnected job is idle' ($w -contains 'VB365:Job:Disconnected') 'False'
 Check 'VB365 restore label'                  ($w -contains 'VB365:Restore:Running') 'True'
 Check 'VB365 does not use -Last'             $script:FakeVboLastRequested 'False'
 Check 'VB365 requests running restores'      $script:FakeVboRestoreStatus 'Running'
@@ -793,6 +795,56 @@ $script:FakeVboOrganizationSyncState = [pscustomobject]@{
     }
 }
 Check 'VB365 quiescent organization sync is idle' @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true).Count 0
+
+# Queued with a later ScheduledTime is VB365's resting state between daily syncs.
+# A run waited on All/Users/Groups/GroupMembers/Sites Queued, Mailboxes out of scope.
+$later = [datetime]::UtcNow.AddHours(6)
+function Q($When) { [pscustomobject]@{ CurrentState = [pscustomobject]@{ Status='Queued'; ScheduledTime=$When } } }
+$script:FakeVboOrganizationSyncState = [pscustomobject]@{
+    CurrentState = [pscustomobject]@{ Status='Queued'; ScheduledTime=$later }
+    Parts = [pscustomobject]@{ Users=(Q $later); Groups=(Q $later); GroupMembers=(Q $later); Sites=(Q $later); Mailboxes=$null }
+}
+Check 'VB365 sync queued for later is idle'    @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true).Count 0
+$script:FakeVboOrganizationSyncState.Parts.Users = (Q ([datetime]::UtcNow.AddMinutes(-5)))
+Check 'VB365 overdue queued sync is active'    (@(Get-ActiveVeeamWork -Vbr $false -Vb365 $true) -contains 'VB365:OrganizationSync:Org A:Users:Queued') 'True'
+$script:FakeVboOrganizationSyncState.Parts.Users = (Q ([datetime]::UtcNow.AddMinutes(5)))
+Check 'VB365 sync due within 15 min is active' (@(Get-ActiveVeeamWork -Vbr $false -Vb365 $true) -contains 'VB365:OrganizationSync:Org A:Users:Queued') 'True'
+$script:FakeVboOrganizationSyncState.Parts.Users = (Q $null)
+Check 'VB365 queued with no time is active'    (@(Get-ActiveVeeamWork -Vbr $false -Vb365 $true) -contains 'VB365:OrganizationSync:Org A:Users:Queued') 'True'
+$script:FakeVboOrganizationSyncState.Parts.Users = [pscustomobject]@{ CurrentState = [pscustomobject]@{ Status='Running'; ScheduledTime=$later } }
+$w = @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true)
+Check 'VB365 running sync is active whatever the time' ($w -contains 'VB365:OrganizationSync:Org A:Users:Running') 'True'
+Check 'VB365 only the running part is listed'  $w.Count 1
+$script:FakeVboOrganizationSyncState.CurrentState = [pscustomobject]@{ Status='FutureSyncState'; ScheduledTime=$later }
+Check 'unknown sync status with a time still fails closed' (Throws { Get-ActiveVeeamWork -Vbr $false -Vb365 $true }) 'True'
+
+$now = [datetime]::new(2026, 10, 13, 1, 0, 0, [DateTimeKind]::Utc)
+Check 'due: no ScheduledTime property'         (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ Status='Queued' }) -NowUtc $now) 'True'
+Check 'due: placeholder year 1'                (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[datetime]::MinValue }) -NowUtc $now) 'True'
+Check 'not due: UTC time in 6 hours'           (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=$now.AddHours(6) }) -NowUtc $now) 'False'
+Check 'not due: offset time in 6 hours'        (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[DateTimeOffset]::new($now.AddHours(6)) }) -NowUtc $now) 'False'
+Check 'due: zone-less time 5 min ahead'        (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[datetime]::SpecifyKind($now.AddMinutes(5), [DateTimeKind]::Unspecified) }) -NowUtc $now) 'True'
+Check 'not due: zone-less time next year'      (Test-Vb365QueuedSyncDue -CurrentState ([pscustomobject]@{ ScheduledTime=[datetime]::SpecifyKind($now.AddYears(1), [DateTimeKind]::Unspecified) }) -NowUtc $now) 'False'
+
+$script:FakeVboOrganizationSyncState = [pscustomobject]@{
+    CurrentState = $null
+    Parts = [pscustomobject]@{
+        Users       = [pscustomobject]@{ CurrentState=$null }
+        Groups      = [pscustomobject]@{ CurrentState=$null }
+        GroupMembers= [pscustomobject]@{ CurrentState=$null }
+        Sites       = [pscustomobject]@{ CurrentState=$null }
+        Mailboxes   = [pscustomobject]@{ CurrentState=$null }
+    }
+}
+
+'--- Ended states are per product ---'
+$vboEndedRows = @([pscustomobject]@{ Status='Disconnected' }, [pscustomobject]@{ Status='Running' })
+Check 'VB365 Disconnected is ended, Running is not' ((Get-ActiveLabelsFromSessions -Sessions $vboEndedRows -Prefix 'VB365:Job' -EndedStates @('Disconnected')) -join ',') 'VB365:Job:Running'
+Check 'without the list Disconnected stays active (VBR)' ((Get-ActiveLabelsFromSessions -Sessions @([pscustomobject]@{ State='Disconnected' }) -Prefix 'VBR:Backup') -join ',') 'VBR:Backup:Disconnected'
+Check 'an ended list never hides an unknown state' (Throws { Get-ActiveLabelsFromSessions -Sessions @([pscustomobject]@{ Status='Mystery' }) -Prefix 'VB365:Job' -EndedStates @('Disconnected') }) 'True'
+Check 'VB365 job sessions pass Disconnected as ended' ($scriptText -match "Get-SessionsFromGetter 'Get-VBOJobSession'\) -Prefix 'VB365:Job' -EndedStates @\('Disconnected'\)") 'True'
+Check 'only data retrieval shares the job statuses' ($scriptText -match "if \(\`$commandName -eq 'Get-VBODataRetrievalSession'\) \{ @\('Disconnected'\) \} else \{ @\(\) \}") 'True'
+Check 'VBR getters never pass ended states'   (@([regex]::Matches($scriptText, "-Prefix 'VBR[^']*'[^\r\n]*-EndedStates")).Count) 0
 
 $script:FakeVboOrganizationSyncState.CurrentState = [pscustomobject]@{ Status='FutureSyncState' }
 Check 'unknown VB365 organization sync status fails closed' (Throws { Get-ActiveVeeamWork -Vbr $false -Vb365 $true }) 'True'
