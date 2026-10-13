@@ -509,7 +509,7 @@ check passes; anything the script cannot prove leaves NATS alone, with the reaso
 2. Waits for VB365 work to finish, disables the jobs, and starts VB365 maintenance mode, as
    for a PostgreSQL update.
 3. Stops every `Veeam*` service (Proxy first), then NATS. PostgreSQL keeps running.
-4. Backs up the service's registry key, the config file, the store's permissions, and the
+4. Backs up the service's registry key, the config file, the store folder's permissions, and the
    whole message store, and checks that the copy holds the same number of files and bytes.
 5. Copies the new `nats-server.exe` into a new version folder beside the old one, and points
    the service at it through the Windows service manager, as KB4742 does with `sc.exe`.
@@ -625,7 +625,7 @@ C:\ProgramData\VeeamPgUpdate\
         nats-server-service.reg     the service's registry key
         nats-server.conf            the config file (it holds the NATS credentials)
         store\                      copy of the whole message store
-        store-acl.txt               the store's original permissions
+        store-acl.txt               the store folder's original permissions
 ```
 
 **The WorkRoot and newly created evidence tree are locked to SYSTEM and Administrators.**

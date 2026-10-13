@@ -1953,9 +1953,13 @@ function Invoke-NatsOnlyUpdate {
         Copy-Item -LiteralPath "$($natsPlan.ConfPath)" -Destination $confBackup -Force -ErrorAction Stop
         if ((Get-FileSha256 $confBackup) -ne $natsPlan.ConfSha256) { throw 'the copy of the config file does not match the original' }
         $natsPlan.ConfBackup = $confBackup
+        # The store folder's own permissions only, not /t: NATS names consumer folders
+        # after their streams, so paths inside the store pass 260 characters, and
+        # icacls cannot read those ("The system cannot find the path specified").
+        # Files in the store inherit from the folder. robocopy handles the long paths.
         $storeAcl = Join-Path $natsBackup 'store-acl.txt'
-        $aclSave = Invoke-Native (Join-Path $env:SystemRoot 'System32\icacls.exe') @("$($natsPlan.StoreDir)", '/save', $storeAcl, '/t', '/q')
-        if ($aclSave.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $storeAcl)) { throw "icacls could not save the message store permissions (exit $($aclSave.ExitCode)) $($aclSave.StdErr)" }
+        $aclSave = Invoke-Native (Join-Path $env:SystemRoot 'System32\icacls.exe') @("$($natsPlan.StoreDir)", '/save', $storeAcl, '/q')
+        if ($aclSave.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $storeAcl)) { throw "icacls could not save the message store folder's permissions (exit $($aclSave.ExitCode)) $($aclSave.StdErr)" }
         $storeBackup = Join-Path $natsBackup 'store'
         $storeCopy = Invoke-Native 'robocopy.exe' @("$($natsPlan.StoreDir)", $storeBackup, '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/XJ', '/NFL', '/NDL', '/NP', '/NJH', '/NJS')
         if ($storeCopy.ExitCode -ge 8) { throw "robocopy of the message store failed (exit $($storeCopy.ExitCode)) $($storeCopy.StdErr)" }

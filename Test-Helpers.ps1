@@ -3065,6 +3065,9 @@ Check 'the package is tried before any job changes' ((Get-FlowAt "'NATS_STAGED_B
 Check 'disk space is checked before any job changes' ((Get-FlowAt "'LOW_DISK'") -lt (Get-FlowAt 'Disable-VeeamManagedJobs')) 'True'
 Check 'the outage is recorded before startup changes' ((Get-FlowAt "Save-RecoveryState -Stage 'SERVICES_STOPPED'") -lt (Get-FlowAt '@(Disable-VeeamServiceStartup)')) 'True'
 Check 'NATS stops after the Veeam services'   ((Get-FlowAt '$preferredStopOrder') -lt (Get-FlowAt "Stop-Service -Name 'nats-server'")) 'True'
+# NATS consumer folders make paths in the store longer than 260 characters, which
+# icacls /t cannot read. Seen on a VB365 8.6 server: only the folder's own ACL is saved.
+Check 'store permissions are saved without /t'  ($natsFlow -match "'/save', \`$storeAcl, '/q'\)" -and $natsFlow -notmatch "'/save', \`$storeAcl, '/t'") 'True'
 Check 'the backup is complete before the switch' ((Get-FlowAt "Set-NatsStage 'BACKED_UP'") -lt (Get-FlowAt "Set-NatsStage 'SWAP_STARTED'")) 'True'
 Check 'switch intent is saved before the new folder' ((Get-FlowAt "Set-NatsStage 'SWAP_STARTED'") -lt (Get-FlowAt 'New-Item -ItemType Directory -Path "$($natsPlan.NewDir)"')) 'True'
 Check 'the new folder exists before the service changes' ((Get-FlowAt 'New-Item -ItemType Directory -Path "$($natsPlan.NewDir)"') -lt (Get-FlowAt 'Set-NatsServicePath -PathName "$($natsPlan.NewImagePath)"')) 'True'
