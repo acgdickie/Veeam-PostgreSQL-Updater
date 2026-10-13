@@ -27,7 +27,13 @@
       - it has been Running for more than MaxRunHours
       - its last sync is more than NotRunHours old (VB365 syncs every 24 hours),
         unless a sync is running within its limit
-    On-premises organisations have no such sync and are not checked.
+    Only Microsoft 365 organisations with modern app-only authentication have this
+    sync. On-premises organisations, and ones still on basic or legacy modern
+    authentication, are not checked.
+
+    A machine counts as a VB365 server when the VB365 service, or its program in
+    Program Files, is there. A machine with only the VB365 console or PowerShell
+    toolkit has nothing to check.
 
     RUNNING IT FROM AN RMM
     The VB365 PowerShell module needs PowerShell 7.4.2 or later. Most RMMs, NinjaOne
@@ -39,8 +45,9 @@
     maxRunHours, maxWaitHours, notRunHours, overdueMinutes, ninjaField, showAll.
     A parameter given on the command line wins over a Script Variable. When the
     script runs under NinjaOne and ninjaField is set, the alert text is also written
-    to that device custom field (Multi-line recommended; a Text field receives a
-    shortened version). A failed write only warns.
+    to that device custom field (Multi-line recommended). If NinjaOne refuses the
+    full text, as it may for a 200-character Text field, a shortened version is
+    written. A failed write only warns.
 
 .PARAMETER MaxRunHours
     A run or sync counts as stuck after Running this many hours. Default 12.
@@ -185,23 +192,32 @@ function Find-PowerShell7 {
     return $null
 }
 
-# Where the VB365 PowerShell module is: in Program Files, or next to the VB365
-# service's program when VB365 is installed in another folder. Installed is true
-# when the module or the VB365 service is there.
+# Is this a VB365 server, and where is its PowerShell module? Installed is true when
+# the VB365 service, or its program in Program Files, is there. The module alone is
+# not enough: the VB365 console and the PowerShell toolkit install it on machines
+# that are not VB365 servers. The module is looked for in Program Files, then next
+# to the service's program (VB365 can be installed in another folder).
 function Find-Vb365Module {
-    $relative = 'Veeam\Backup365\Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
+    $relative = 'Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
+    $folders = @()
     foreach ($root in @($env:ProgramW6432, $env:ProgramFiles)) {
-        if (-not $root) { continue }
-        $candidate = Join-Path $root $relative
+        if ($root) { $folders += Join-Path $root 'Veeam\Backup365' }
+    }
+    $service = Get-Service -Name 'Veeam.Archiver.Service' -ErrorAction SilentlyContinue
+    $installed = [bool]$service
+    foreach ($folder in $folders) {
+        if (Test-Path -LiteralPath (Join-Path $folder 'Veeam.Archiver.Service.exe') -PathType Leaf) { $installed = $true }
+    }
+    if (-not $installed) { return [pscustomobject]@{ Path = $null; Installed = $false } }
+    foreach ($folder in $folders) {
+        $candidate = Join-Path $folder $relative
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { return [pscustomobject]@{ Path = $candidate; Installed = $true } }
     }
-    if (-not (Get-Service -Name 'Veeam.Archiver.Service' -ErrorAction SilentlyContinue)) {
-        return [pscustomobject]@{ Path = $null; Installed = $false }
-    }
+    if (-not $service) { return [pscustomobject]@{ Path = $null; Installed = $true } }
     $serviceCommand = "$((Get-CimInstance Win32_Service -Filter "Name='Veeam.Archiver.Service'" -ErrorAction Stop).PathName)".Trim()
     $exe = if ($serviceCommand -match '^"([^"]+)"') { $Matches[1] } elseif ($serviceCommand -match '^(.+?\.exe)\b') { $Matches[1] } else { $serviceCommand }
     if ($exe) {
-        $candidate = Join-Path (Split-Path -Parent $exe) 'Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
+        $candidate = Join-Path (Split-Path -Parent $exe) $relative
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { return [pscustomobject]@{ Path = $candidate; Installed = $true } }
     }
     return [pscustomobject]@{ Path = $null; Installed = $true }
@@ -721,8 +737,16 @@ if (-not $notApplicable -and $checkErrors.Count -eq 0) {
     foreach ($org in $organizations) {
         $orgName = "$(Get-Prop $org 'Name')"
         if (-not $orgName) { $orgName = "$(Get-Prop $org 'Id')" }
-        # Only Microsoft 365 organisations have this sync; on-premises ones do not.
+        # Only Microsoft 365 organisations with modern app-only authentication have
+        # this sync. On-premises ones, and ones still on basic or legacy modern
+        # authentication, do not. When no authentication type can be read, the
+        # organisation is still checked.
         if ("$(Get-Prop $org 'Type')" -eq 'OnPremises') { continue }
+        $authTypes = @(foreach ($connection in @('Office365ExchangeConnectionSettings', 'Office365SharePointConnectionSettings')) {
+            $authType = "$(Get-Prop (Get-Prop $org $connection) 'AuthenticationType')"
+            if ($authType) { $authType }
+        })
+        if ($authTypes.Count -gt 0 -and $authTypes -notcontains 'ApplicationOnly') { continue }
         try { $syncState = Get-VBOOrganizationSynchronizationState -Organization $org -ErrorAction Stop }
         catch { $checkErrors += "organisation '$orgName': could not read its sync state: $($_.Exception.Message)"; continue }
         if ($null -eq $syncState) { $checkErrors += "organisation '$orgName': no sync state was returned"; continue }

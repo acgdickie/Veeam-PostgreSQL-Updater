@@ -262,9 +262,12 @@ try {
 }
 
 '--- Finding VB365 ---'
-# Program Files is empty here, so only the VB365 service can show where VB365 is.
+# A VB365 server has the VB365 service, or its program in Program Files. The module
+# alone (the VB365 console or PowerShell toolkit) is not a VB365 server.
 $vbDir = Join-Path $env:TEMP "find-stuck-fakevb-$PID"
 New-Item -ItemType Directory -Path (Join-Path $vbDir 'Veeam.Archiver.PowerShell') -Force | Out-Null
+$pfBackup365 = Join-Path $vbDir 'pf\Veeam\Backup365'
+New-Item -ItemType Directory -Path (Join-Path $pfBackup365 'Veeam.Archiver.PowerShell') -Force | Out-Null
 $savedRoots = $env:ProgramW6432, $env:ProgramFiles
 try {
     $env:ProgramW6432 = Join-Path $vbDir 'empty'; $env:ProgramFiles = $env:ProgramW6432
@@ -272,6 +275,14 @@ try {
         function Get-Service { $null }
         $r = Find-Vb365Module
         Check 'no module and no service: not installed' "$($r.Installed) $($null -eq $r.Path)" 'False True'
+        $env:ProgramW6432 = Join-Path $vbDir 'pf'; $env:ProgramFiles = $env:ProgramW6432
+        Set-Content -LiteralPath (Join-Path $pfBackup365 'Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1') -Value '@{}'
+        $r = Find-Vb365Module
+        Check 'module only (console or toolkit): not installed' "$($r.Installed) $($null -eq $r.Path)" 'False True'
+        Set-Content -LiteralPath (Join-Path $pfBackup365 'Veeam.Archiver.Service.exe') -Value 'fake'
+        $r = Find-Vb365Module
+        Check 'service program in Program Files: installed' "$($r.Installed) $($r.Path)" "True $(Join-Path $pfBackup365 'Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1')"
+        $env:ProgramW6432 = Join-Path $vbDir 'empty'; $env:ProgramFiles = $env:ProgramW6432
     }
     & {
         function Get-Service { [pscustomobject]@{ Name = 'Veeam.Archiver.Service' } }
@@ -336,10 +347,13 @@ try {
     $fakeRoot = Join-Path $e2e 'pf'
     $moduleDir = Join-Path $fakeRoot 'Veeam\Backup365\Veeam.Archiver.PowerShell'
     New-Item -ItemType Directory -Path $moduleDir -Force | Out-Null
+    # The service program makes it a VB365 server; without it, it is only a console.
+    Set-Content -LiteralPath (Join-Path $fakeRoot 'Veeam\Backup365\Veeam.Archiver.Service.exe') -Value 'fake'
     Set-Content -LiteralPath (Join-Path $moduleDir 'Veeam.Archiver.PowerShell.psd1') -Encoding ASCII -Value "@{ RootModule = 'Veeam.Archiver.PowerShell.psm1'; ModuleVersion = '8.0.0'; PowerShellVersion = '7.0'; FunctionsToExport = '*' }"
     Set-Content -LiteralPath (Join-Path $moduleDir 'Veeam.Archiver.PowerShell.psm1') -Encoding ASCII -Value @'
 # Fake VB365: a cut-off job with an accent in its name, a healthy job, an on-premises
-# organisation (its sync state cannot be read) and an organisation sync queued 13 days.
+# organisation and a legacy-auth one (their sync state cannot be read), and an
+# organisation sync queued 13 days.
 $now = Get-Date
 $daily = [pscustomobject]@{ Type = 'Daily'; DailyType = 'Everyday'; EnableSchedule = $true }
 function Connect-VBOServer {
@@ -360,11 +374,19 @@ function Get-VBOJobSession {
 function Get-VBOOrganization {
     [CmdletBinding()] param()
     [pscustomobject]@{ Name = 'onprem.example'; Type = 'OnPremises' }
-    [pscustomobject]@{ Name = 'contoso.onmicrosoft.com'; Type = 'Office365' }
+    [pscustomobject]@{ Name = 'legacy.onmicrosoft.com'; Type = 'Office365'
+        Office365ExchangeConnectionSettings = [pscustomobject]@{ AuthenticationType = 'Modern' } }
+    [pscustomobject]@{ Name = 'contoso.onmicrosoft.com'; Type = 'Office365'
+        Office365ExchangeConnectionSettings = [pscustomobject]@{ AuthenticationType = 'ApplicationOnly' } }
+    [pscustomobject]@{ Name = 'fabrikam.onmicrosoft.com'; Type = 'Office365' }
 }
 function Get-VBOOrganizationSynchronizationState {
     [CmdletBinding()] param($Organization)
-    if ($Organization.Type -eq 'OnPremises') { throw 'This organization does not support synchronization.' }
+    if ($Organization.Name -eq 'fabrikam.onmicrosoft.com') {
+        $later = [pscustomobject]@{ Status = 'Queued'; ScheduledTime = $now.AddHours(18); StartTime = $null }
+        return [pscustomobject]@{ LastSyncTime = $now.AddHours(-6); SyncStatus = 'Success'; CurrentState = $later; Parts = $null }
+    }
+    if ($Organization.Name -ne 'contoso.onmicrosoft.com') { throw 'This organization does not support synchronization.' }
     $queued = [pscustomobject]@{ Status = 'Queued'; ScheduledTime = $now.AddDays(-13); StartTime = $null }
     [pscustomobject]@{
         LastSyncTime = $now.AddDays(-13).AddMinutes(-59); SyncStatus = 'Success'; CurrentState = $queued
@@ -431,8 +453,19 @@ function Get-VBOOrganizationSynchronizationState {
     Check 'the alert names the cut-off job'      (Has $r "^- Job 'Caf.* Exchange Backup' \(backup job\): last run was cut off \(Disconnected\)") 1
     Check 'the alert names the stuck sync'       (Has $r "^- Organisation 'contoso\.onmicrosoft\.com': sync queued since .* and never started \(All, Users\)") 1
     Check 'an on-premises organisation is skipped' (Has $r 'onprem\.example') 0
+    Check 'a legacy-auth organisation is skipped' (Has $r 'legacy\.onmicrosoft\.com') 0
+    Check 'an organisation with no auth type shown is still checked' (Has $r '^OK: 1 job\(s\) healthy, 1 organisation\(s\) syncing normally\.') 1
     Check 'the summary names both'               (Has $r 'Outcome=STUCK; ExitCode=5; StuckCount=2; Stuck=Caf.* Exchange Backup \[cut off\]; contoso\.onmicrosoft\.com sync \[never started, not synced\]') 1
     Check 'the field names the job, accent kept' ((Seen 'stdin.txt').Contains("- Job '$cafe' (backup job)")) 'True'
+
+    # A machine with only the VB365 console: the module is there, the service is not.
+    $consoleRoot = Join-Path $e2e 'console'
+    Copy-Item -LiteralPath $fakeRoot -Destination $consoleRoot -Recurse
+    Remove-Item -LiteralPath (Join-Path $consoleRoot 'Veeam\Backup365\Veeam.Archiver.Service.exe')
+    [Environment]::SetEnvironmentVariable('ProgramW6432', $consoleRoot)
+    $r = Run
+    Check 'a console-only machine has nothing to check' "$($r.Code) $(Has $r 'Outcome=NOT_APPLICABLE')" '0 1'
+    [Environment]::SetEnvironmentVariable('ProgramW6432', $fakeRoot)
 
     # A connection error with a line break: still one summary line.
     [Environment]::SetEnvironmentVariable('NINJA_AGENT_NODE_ID', $null)

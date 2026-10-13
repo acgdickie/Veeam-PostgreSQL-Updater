@@ -40,7 +40,7 @@ Users, Groups, GroupMembers, Sites, Mailboxes):
 | Not synced | LastSyncTime older than NotRunHours, or none, unless a sync is running within its limit |
 
 A part queued for the same run as a sync that is running within its limit is waiting its
-turn, not "never started". Organisations of Type `OnPremises` have no sync and are skipped.
+turn, not "never started". Organisations of Type `OnPremises` have no sync and are skipped, and so are organisations whose connection settings show basic or legacy modern authentication (no `ApplicationOnly`). An organisation with no authentication type shown is still checked.
 
 Times from VB365 are compared in local time (VB365 returns local times; UTC values are
 converted).
@@ -56,7 +56,7 @@ converted).
   under 5.1. An empty parameter is passed on as `""`.
 - VB365 not installed: exit 0, "nothing to check", also when PowerShell 7 is missing.
   VB365 is found in Program Files, or next to the `Veeam.Archiver.Service` program. The
-  service without the module is a check failure.
+  service without the module is a check failure. A machine counts as VB365 only with the `Veeam.Archiver.Service` service or its program in Program Files: the module alone (VB365 console or PowerShell toolkit) is "not installed".
 - Exit codes: 0 nothing stuck; 5 something stuck; 1 could not check. Stuck wins over a
   partial check failure; both are listed.
 
