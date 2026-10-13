@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Finds stuck Veeam Backup for Microsoft 365 (VB365) jobs and a stuck organisation
-    sync, for monitoring and alerting from an RMM such as NinjaOne. Read-only.
+    Finds stuck Veeam Backup for Microsoft 365 (VB365, also called VBM) jobs and a
+    stuck organisation sync, for monitoring and alerting from an RMM such as NinjaOne.
+    Read-only.
 
 .DESCRIPTION
     Checks every VB365 backup job and backup copy job, and every organisation's data
@@ -86,10 +87,10 @@ $ErrorActionPreference = 'Stop'
 
 # The child run under PowerShell 7 hands the alert text to the parent through this
 # file, so the parent - the process NinjaOne started - writes the custom field.
-$script:FieldFileVariable = 'FIND_STUCK_VEEAM_JOBS_FIELD_FILE'
+$script:FieldFileVariable = 'FIND_STUCK_VBM_JOBS_FIELD_FILE'
 # Set before the restart, so a restart that still did not reach PowerShell 7 never
 # restarts again.
-$script:RestartVariable = 'FIND_STUCK_VEEAM_JOBS_RESTARTED'
+$script:RestartVariable = 'FIND_STUCK_VBM_JOBS_RESTARTED'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -616,7 +617,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     if ($wantField) {
         try {
             # Not GetTempFileName: it fails once %TEMP% holds 65,536 tmp*.tmp files.
-            $fieldFile = Join-Path ([IO.Path]::GetTempPath()) ('find-stuck-veeam-jobs-{0}.txt' -f [guid]::NewGuid())
+            $fieldFile = Join-Path ([IO.Path]::GetTempPath()) ('find-stuck-vbm-jobs-{0}.txt' -f [guid]::NewGuid())
             [IO.File]::WriteAllText($fieldFile, '')
             [Environment]::SetEnvironmentVariable($script:FieldFileVariable, $fieldFile, 'Process')
         } catch {

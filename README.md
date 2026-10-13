@@ -51,8 +51,8 @@ Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 | `Update-VeeamPreReqs.ps1` | The update script. **The only file your RMM needs for the update** |
 | `Clear-StaleEnterpriseManagerRecord.ps1` | Separate manual tool. Checks, and can clear, a leftover Enterprise Manager connection record inside the VBR database. Not for the RMM. See [the separate tool](#the-separate-tool-clear-staleenterprisemanagerrecordps1) |
 | `Test-Helpers.ps1` | The tests for `Update-VeeamPreReqs.ps1`, plus the configuration backup check in `Clear-StaleEnterpriseManagerRecord.ps1`. For whoever edits the scripts, never for a server. See [Why `Test-Helpers.ps1` is there](#why-test-helpersps1-is-there) |
-| `Find-StuckVeeamJobs.ps1` | Separate, read-only monitoring script. Finds stuck VB365 jobs and a stuck organisation sync, and names each one. For an RMM such as NinjaOne. See [Finding stuck VB365 jobs](#finding-stuck-vb365-jobs-find-stuckveeamjobsps1) |
-| `Test-FindStuckVeeamJobs.ps1` | The tests for `Find-StuckVeeamJobs.ps1`. For whoever edits it, never for a server |
+| `Find-StuckVBMJobs.ps1` | Separate, read-only monitoring script. Finds stuck VBM (VB365) jobs and a stuck organisation sync, and names each one. For an RMM such as NinjaOne. See [Finding stuck VBM jobs](#finding-stuck-vbm-jobs-find-stuckvbmjobsps1) |
+| `Test-FindStuckVBMJobs.ps1` | The tests for `Find-StuckVBMJobs.ps1`. For whoever edits it, never for a server |
 
 The settings are built into the script, so an RMM that uploads just the one file to a
 temp folder works.
@@ -875,12 +875,12 @@ tested profile that protects every database, proxy, service, and schedule involv
   PowerShell editions. **Pilot each new product, version and PowerShell edition on one
   non-production server before fleet rollout.**
 
-## Finding stuck VB365 jobs: `Find-StuckVeeamJobs.ps1`
+## Finding stuck VBM jobs: `Find-StuckVBMJobs.ps1`
 
 **What it is**
 
 A separate, read-only script for monitoring and alerting. It checks every Veeam Backup for
-Microsoft 365 (VB365) backup job, backup copy job and organisation sync. When something is
+Microsoft 365 (VB365 / VBM) backup job, backup copy job and organisation sync. When something is
 stuck, it says which job or organisation, why, and the times that matter. It changes
 nothing. It is not part of the update script, and the update script does not need it.
 
@@ -960,7 +960,7 @@ is not valid is a check failure (exit `1`).
 **How to run it from any RMM**
 
 * Run it on the VB365 server, as SYSTEM, with Windows PowerShell (64-bit).
-* Upload `Find-StuckVeeamJobs.ps1` only. It needs no other file.
+* Upload `Find-StuckVBMJobs.ps1` only. It needs no other file.
 * The VB365 PowerShell module needs PowerShell 7.4.2 or later. The script restarts itself
   under PowerShell 7 (`pwsh.exe`) and passes the exit code back. PowerShell 7 must be
   installed on every VB365 server.
@@ -970,15 +970,15 @@ is not valid is a check failure (exit `1`).
   `Key=Value; ...` summary line, for RMMs that parse output.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Find-StuckVeeamJobs.ps1
-powershell -ExecutionPolicy Bypass -File .\Find-StuckVeeamJobs.ps1 -MaxRunHours 8 -ShowAll
+powershell -ExecutionPolicy Bypass -File .\Find-StuckVBMJobs.ps1
+powershell -ExecutionPolicy Bypass -File .\Find-StuckVBMJobs.ps1 -MaxRunHours 8 -ShowAll
 ```
 
 **How to run it from NinjaOne**
 
 1. Add a new script in the NinjaOne automation library: language PowerShell, operating
    system Windows, architecture 64-bit (or All), run as System. Paste in the whole of
-   `Find-StuckVeeamJobs.ps1`.
+   `Find-StuckVBMJobs.ps1`.
 2. Optional: add Script Variables to change the settings, named `maxRunHours`,
    `maxWaitHours`, `notRunHours`, `overdueMinutes` (integer), `ninjaField` (string) and
    `showAll` (checkbox). Leave one out to use its default.
@@ -997,7 +997,7 @@ with exit `5` means it worked and found something stuck.
 
 **Tests**
 
-`Test-FindStuckVeeamJobs.ps1` is the safety net for changes to `Find-StuckVeeamJobs.ps1`. It
+`Test-FindStuckVBMJobs.ps1` is the safety net for changes to `Find-StuckVBMJobs.ps1`. It
 reads the real functions out of the script and runs the rules against fake VB365 objects.
 It also starts the real script with Windows PowerShell 5.1, the way an RMM does, against a
 fake VB365 module, a fake `ninjarmm-cli` and a missing or broken PowerShell 7. It needs no
@@ -1005,11 +1005,11 @@ VB365. It creates throw-away files under `%TEMP%` only, and removes them again. 
 both editions:
 
 ```bash
-powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVeeamJobs.ps1
+powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVBMJobs.ps1
 ```
 
 ```bash
-pwsh.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVeeamJobs.ps1
+pwsh.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVBMJobs.ps1
 ```
 
 A pass ends with `RESULT: <n> passed, 0 failed` and exit code `0`.

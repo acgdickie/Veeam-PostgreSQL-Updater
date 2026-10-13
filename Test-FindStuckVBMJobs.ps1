@@ -1,20 +1,20 @@
-# The tests for Find-StuckVeeamJobs.ps1. For whoever edits the script: never copy this
+# The tests for Find-StuckVBMJobs.ps1. For whoever edits the script: never copy this
 # file to a Veeam server or add it to the RMM.
 #
-# Extracts the real functions out of Find-StuckVeeamJobs.ps1 via the AST and runs the
+# Extracts the real functions out of Find-StuckVBMJobs.ps1 via the AST and runs the
 # stuck rules against fake VB365 objects, so no VB365 is needed. The end-to-end part
 # runs the real script on this PC (which has no VB365): Windows PowerShell 5.1 must
 # restart it under PowerShell 7, pass the exit code back, and write a fake NinjaOne
 # field. Only throw-away files under %TEMP% are created, and removed again.
 #
 # Run after every change, on BOTH editions:
-#   powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVeeamJobs.ps1
-#   pwsh.exe       -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVeeamJobs.ps1
+#   powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVBMJobs.ps1
+#   pwsh.exe       -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVBMJobs.ps1
 # A pass ends "RESULT: <n> passed, 0 failed" with exit code 0.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$script:Path = Join-Path $PSScriptRoot 'Find-StuckVeeamJobs.ps1'
+$script:Path = Join-Path $PSScriptRoot 'Find-StuckVBMJobs.ps1'
 $errs = $null; $toks = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Path, [ref]$toks, [ref]$errs)
 if ($errs -and $errs.Count) { throw "parse errors: $($errs.Count)" }
@@ -303,7 +303,7 @@ Check 'reads the latest run per job'          ($scriptText -match 'Get-VBOJobSes
 $e2e = Join-Path $env:TEMP "find-stuck-e2e-$PID"
 New-Item -ItemType Directory -Path $e2e -Force | Out-Null
 $envNames = 'NINJA_AGENT_NODE_ID','NINJARMMCLI','NinjaField','MaxRunHours','ShowAll','ProgramW6432','FAKE_VBO_MODE',
-            'FIND_STUCK_VEEAM_JOBS_RESTARTED','FIND_STUCK_VEEAM_JOBS_FIELD_FILE'
+            'FIND_STUCK_VBM_JOBS_RESTARTED','FIND_STUCK_VBM_JOBS_FIELD_FILE'
 $saved = @{}
 foreach ($name in $envNames) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
 $realProgramW6432 = $saved['ProgramW6432']
@@ -405,7 +405,7 @@ function Get-VBOOrganizationSynchronizationState {
     $recordingCli = @(
         '@echo off',
         'echo %* > "%~dp0args.txt"',
-        'if defined FIND_STUCK_VEEAM_JOBS_FIELD_FILE (echo yes> "%~dp0handoff.txt") else (echo no> "%~dp0handoff.txt")',
+        'if defined FIND_STUCK_VBM_JOBS_FIELD_FILE (echo yes> "%~dp0handoff.txt") else (echo no> "%~dp0handoff.txt")',
         'findstr "^" > "%~dp0stdin.txt"',
         'exit /b 0'
     )

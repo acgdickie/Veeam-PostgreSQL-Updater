@@ -1,4 +1,4 @@
-# Find-StuckVeeamJobs.ps1 - design
+# Find-StuckVBMJobs.ps1 - design
 
 Date: 2026-10-13. Status: approved for build.
 
@@ -96,7 +96,7 @@ write only warns; it never changes the exit code.
 
 ## Testing
 
-Own test file `Test-FindStuckVeeamJobs.ps1` (the update script's `Test-Helpers.ps1` is
+Own test file `Test-FindStuckVBMJobs.ps1` (the update script's `Test-Helpers.ps1` is
 untouched). It extracts the real functions by AST and runs the rules against fake VB365
 objects, including the real case: a job whose last run ended Disconnected, and an
 organisation whose sync was queued 13 days ago and never started. End-to-end on a PC
