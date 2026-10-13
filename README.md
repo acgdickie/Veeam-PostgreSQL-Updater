@@ -47,9 +47,11 @@ Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 
 | File | What it is |
 |---|---|
-| `Update-VeeamPreReqs.ps1` | The script. **The only file your RMM needs** |
+| `Update-VeeamPreReqs.ps1` | The update script. **The only file your RMM needs for the update** |
 | `Clear-StaleEnterpriseManagerRecord.ps1` | Separate manual tool. Checks, and can clear, a leftover Enterprise Manager connection record inside the VBR database. Not for the RMM. See [the separate tool](#the-separate-tool-clear-staleenterprisemanagerrecordps1) |
 | `Test-Helpers.ps1` | The tests for `Update-VeeamPreReqs.ps1`, plus the configuration backup check in `Clear-StaleEnterpriseManagerRecord.ps1`. For whoever edits the scripts, never for a server. See [Why `Test-Helpers.ps1` is there](#why-test-helpersps1-is-there) |
+| `Find-StuckVeeamJobs.ps1` | Separate, read-only monitoring script. Finds stuck VB365 jobs and a stuck organisation sync, and names each one. For an RMM such as NinjaOne. See [Finding stuck VB365 jobs](#finding-stuck-vb365-jobs-find-stuckveeamjobsps1) |
+| `Test-FindStuckVeeamJobs.ps1` | The tests for `Find-StuckVeeamJobs.ps1`. For whoever edits it, never for a server |
 
 The settings are built into the script, so an RMM that uploads just the one file to a
 temp folder works.
@@ -674,7 +676,7 @@ servers where Enterprise Manager has been uninstalled.
 * Reading the record uses the same internal class, which may not exist on every VBR
   version. Kept apart, that can never stop a PostgreSQL update.
 
-**Do not add it to the RMM.** The RMM needs only `Update-VeeamPreReqs.ps1`.
+**Do not add it to the RMM.** For the update, the RMM needs only `Update-VeeamPreReqs.ps1`.
 
 **How to run it**
 
@@ -737,3 +739,142 @@ tested profile that protects every database, proxy, service, and schedule involv
 * **Pilot first.** VB365 support needs VB365 8.6 or later. The unit tests pass on both
   PowerShell editions. **Pilot each new product, version and PowerShell edition on one
   non-production server before fleet rollout.**
+
+## Finding stuck VB365 jobs: `Find-StuckVeeamJobs.ps1`
+
+**What it is**
+
+A separate, read-only script for monitoring and alerting. It checks every Veeam Backup for
+Microsoft 365 (VB365) backup job, backup copy job and organisation sync. When something is
+stuck, it says which job or organisation, why, and the times that matter. It changes
+nothing. It is not part of the update script, and the update script does not need it.
+
+**What counts as stuck**
+
+An enabled backup job or backup copy job is stuck when:
+
+| Rule | Stuck when | Default |
+|---|---|---|
+| Running too long | Its latest run is `Running` for more than `MaxRunHours` | 12 hours |
+| Waiting too long | Its latest run is `Queued` or `Updating` for more than `MaxWaitHours` | 24 hours |
+| Missed its schedule | It is not running, and its next run time passed more than `OverdueMinutes` ago | 60 minutes |
+| Not run for too long | It is not running, and its last run is older than `NotRunHours`, or it never ran | 36 hours |
+| Last run cut off | Its latest run ended `Disconnected` | - |
+
+* `NotRunHours` is for a daily job. A job that runs on fewer days gets the extra time between
+  its runs on top: Workdays +48 hours, Weekends +120 hours, one day a week +144 hours.
+* A job with its schedule turned off runs only by hand. It is never stuck for not running,
+  but the other rules still apply.
+* An `Immediate` backup copy job follows the schedule of its backup job.
+* A new job that waits for its first run is not stuck.
+* A disabled job is listed as INFO, never as stuck.
+
+An organisation sync is stuck when:
+
+| Rule | Stuck when |
+|---|---|
+| Never started | It is `Queued`, its scheduled time passed more than `OverdueMinutes` ago, and it never started |
+| Running too long | It is `Running` for more than `MaxRunHours` |
+| Not synced | Its last sync is older than `NotRunHours`, or it never synced. Not while a sync runs within its limit |
+
+* A part that waits its turn in a sync that is running within its limit is not stuck.
+* On-premises organisations have no such sync. They are not checked.
+
+**What the output looks like**
+
+When something is stuck, the output starts with one line per stuck item:
+
+```text
+VB365 STUCK: 2 problem(s) on SERVER (checked 2026-10-13 12:30)
+- Job 'Exchange Backup' (backup job): last run was cut off (Disconnected) at 2026-10-12 23:00. Last backup: 2026-10-11 23:05.
+- Organisation 'contoso.onmicrosoft.com': sync queued since 2026-10-01 03:00 and never started (All, Users). Last sync: 2026-10-01 02:05 (Success).
+OK: 3 job(s) healthy, 0 organisation(s) syncing normally.
+=== RMM SUMMARY ===
+Computer=SERVER; Outcome=STUCK; ExitCode=5; StuckCount=2; Stuck=Exchange Backup [cut off]; contoso.onmicrosoft.com sync [never started, not synced]; Detail=; Checked=2026-10-13T12:30:00
+```
+
+When nothing is stuck, it prints one line, `VB365 OK on SERVER (checked ...): ...`, and then
+the summary. `-ShowAll` also lists every healthy and disabled job and organisation.
+
+**Exit codes**
+
+| Exit | Meaning |
+|---|---|
+| `0` | Nothing is stuck. Or VB365 is not installed on this server: nothing to check, and PowerShell 7 is not needed |
+| `5` | Something is stuck. The output names each job or organisation and why |
+| `1` | The check could not run. For example: VB365 is installed but PowerShell 7 is not, a setting is not valid, or the script could not connect to VB365. The output says why |
+
+When something is stuck and part of the check also failed, the exit code is `5` and both are
+listed.
+
+**Settings**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `-MaxRunHours` | `12` | A job run or a sync is stuck after `Running` this many hours |
+| `-MaxWaitHours` | `24` | A job run is stuck after `Queued` or `Updating` this many hours |
+| `-NotRunHours` | `36` | A daily job, or a sync, is stuck when its last run is older than this |
+| `-OverdueMinutes` | `60` | Grace after a job's next run time, or a sync's scheduled time |
+| `-NinjaField` | empty | NinjaOne only: the device custom field to write the result to |
+| `-ShowAll` | off | Also list healthy and disabled items |
+
+A setting not given on the command line comes from an environment variable with the same
+name. This is how NinjaOne Script Variables arrive. A command-line value wins. A value that
+is not valid is a check failure (exit `1`).
+
+**How to run it from any RMM**
+
+* Run it on the VB365 server, as SYSTEM, with Windows PowerShell (64-bit).
+* Upload `Find-StuckVeeamJobs.ps1` only. It needs no other file.
+* The VB365 PowerShell module needs PowerShell 7.4.2 or later. The script restarts itself
+  under PowerShell 7 (`pwsh.exe`) and passes the exit code back. PowerShell 7 must be
+  installed on every VB365 server.
+* Alert on exit `5` (stuck). Alert on exit `1` too (the check could not run), maybe at a lower
+  severity.
+* Put the output in the alert. The stuck lines are at the top. The last line is one
+  `Key=Value; ...` summary line, for RMMs that parse output.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Find-StuckVeeamJobs.ps1
+powershell -ExecutionPolicy Bypass -File .\Find-StuckVeeamJobs.ps1 -MaxRunHours 8 -ShowAll
+```
+
+**How to run it from NinjaOne**
+
+1. Add a new script in the NinjaOne automation library: language PowerShell, operating
+   system Windows, architecture 64-bit (or All), run as System. Paste in the whole of
+   `Find-StuckVeeamJobs.ps1`.
+2. Optional: add Script Variables to change the settings, named `maxRunHours`,
+   `maxWaitHours`, `notRunHours`, `overdueMinutes` (integer), `ninjaField` (string) and
+   `showAll` (checkbox). Leave one out to use its default.
+3. Optional: to see the result on the device, add a device custom field of type
+   **Multi-line**, with script access set to write. Put its name in `ninjaField`. The script
+   then writes the alert text to that field on every run. A Text field also works, but it
+   holds only 200 characters, so it gets a short version. A failed field write only warns:
+   it never changes the exit code.
+4. In a policy, add a **Script Result** condition that runs the script on a schedule, for
+   example every 4 hours. Alert when the result code is `5`, and include the script output
+   in the alert, so the alert names the stuck jobs. Add a second condition for result code
+   `1` if you also want to know when the check could not run.
+
+NinjaOne shows every non-zero exit code as a failed script. For this script, a "failed" run
+with exit `5` means it worked and found something stuck.
+
+**Tests**
+
+`Test-FindStuckVeeamJobs.ps1` is the safety net for changes to `Find-StuckVeeamJobs.ps1`. It
+reads the real functions out of the script and runs the rules against fake VB365 objects.
+It also starts the real script with Windows PowerShell 5.1, the way an RMM does, against a
+fake VB365 module, a fake `ninjarmm-cli` and a missing or broken PowerShell 7. It needs no
+VB365. It creates throw-away files under `%TEMP%` only, and removes them again. Run it on
+both editions:
+
+```bash
+powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVeeamJobs.ps1
+```
+
+```bash
+pwsh.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVeeamJobs.ps1
+```
+
+A pass ends with `RESULT: <n> passed, 0 failed` and exit code `0`.
