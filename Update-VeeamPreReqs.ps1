@@ -24,25 +24,37 @@
     PostgreSQL, tune it, start services, and turn jobs back on. No backup or
     restore is forcibly terminated.
 
-    It does NOT reboot. Veeam's KBs recommend a server restart after the update,
-    so it reports RebootRequired=True for the RMM to handle under a change freeze.
-    The legacy -Reboot switch is accepted but safely deferred for the same reason.
+    It does not reboot unless you pass -Reboot. Veeam's KBs recommend a server
+    restart after the update. Without -Reboot it reports RebootRequired=True for
+    the RMM to handle. With -Reboot, after a fully successful update, it books a
+    restart -RebootDelaySeconds later (default 120), so the run finishes and the
+    RMM collects its output before Windows restarts.
 
 .PARAMETER Install
     Actually perform the update. Without this the script only reports.
 
 .PARAMETER Reboot
-    Compatibility switch retained for existing RMM commands. The script does not
-    reboot automatically: after schedules are re-enabled there is no atomic VBR
-    barrier that can prevent new work between an idle check and Windows shutdown.
-    A successful run therefore returns 6 (or 8 on EOL) with RebootRequired=True so
-    the RMM can enforce a change freeze, reboot, verify boot time, and rerun audit.
+    With -Install: after a fully successful update, book a Windows restart
+    -RebootDelaySeconds later, so this run finishes and the RMM collects its output
+    first. It returns 0 (or 7 on an EOL branch) with RebootScheduledAt set. Cancel a
+    booked restart with: shutdown /a
+    Just before booking it, the run checks for Veeam work once more. Once schedules
+    are back on, VBR has no barrier that stops new work, so if a job or restore has
+    started, or an Explorer is open, no restart is booked and the run returns 6 (or
+    8) for the RMM to reboot later. An open console does not stop the restart.
+    Never restarts after a failed, partial or rolled-back run, or when no update
+    was needed. Does nothing without -Install.
+
+.PARAMETER RebootDelaySeconds
+    Seconds between booking the restart and Windows restarting, 30 to 3600.
+    Default 120. Only used with -Reboot.
 
 .PARAMETER Recover
     Recover a run that was interrupted before the PostgreSQL installer started.
     This restores captured service and job state only from the validated recovery
-    manifest. If the installer may have started, recovery is diagnostic-only and
-    exits 40 or 50 for an operator; it never rolls database files back automatically.
+    manifest. If the installer has started, it finishes the run only when PostgreSQL
+    proves healthy at the target version; otherwise it is diagnostic-only and exits
+    40 or 50 for an operator. It never rolls database files back automatically.
 
 .PARAMETER WorkRoot
     Local folder for logs, dumps and the cold copy. Default C:\ProgramData\VeeamPgUpdate
@@ -65,10 +77,12 @@
 
 .NOTES
     EXIT CODES (for your RMM):
-      0  OK            - healthy, with no outstanding RMM action
+      0  OK            - healthy, with no outstanding RMM action. Also: updated,
+                         and -Reboot booked the restart (RebootScheduledAt)
       5  UPDATE        - supported branch: audit found an update
       6  REBOOT        - supported branch: update succeeded; reboot required
-      7  EOL           - EOL branch; major migration required
+      7  EOL           - EOL branch; major migration required. Also: updated on
+                         an EOL branch, and -Reboot booked the restart
       8  EOL+REBOOT    - EOL branch; reboot and major migration required
       9  EOL+UPDATE    - EOL branch; minor update and major migration required
       10 RETRY         - safe transient result; retry later
@@ -94,6 +108,7 @@
 param(
     [switch] $Install,
     [switch] $Reboot,
+    [ValidateRange(30, 3600)][int] $RebootDelaySeconds = 120,
     [switch] $Recover,
     [string] $WorkRoot = 'C:\ProgramData\VeeamPgUpdate',
     [switch] $SkipDownloadInAudit,
@@ -250,6 +265,7 @@ $script:Report       = [ordered]@{
     Outcome        = 'UNKNOWN'
     ExitCode       = $null
     RebootRequired = $false
+    RebootScheduledAt = ''
     IssueCode      = ''
     ActionRequired = ''
     JobsLeftDisabled = ''
@@ -378,6 +394,43 @@ function Get-PolicyExitCode {
     if ($RebootRequired) { return 6 }
     if ($UpdateAvailable) { return 5 }
     return 0
+}
+
+# Book a Windows restart a short time from now, so this run can finish and the RMM
+# can collect its output first. Called only after a fully successful update. Once
+# schedules are back on, VBR has no barrier that stops new work, so one last
+# activity read is the guard: a running job or restore, an open Explorer (it can be
+# running a restore), or an activity read that fails means no restart is booked.
+# An open console does not block; Windows closes it at restart.
+# Cancel a booked restart with: shutdown /a
+function Invoke-DelayedReboot {
+    param(
+        [Parameter(Mandatory)][ValidateRange(30, 3600)][int] $DelaySeconds,
+        [bool] $Vbr,
+        [bool] $Vb365
+    )
+    $busy = @()
+    try { $busy = @(Get-ActiveVeeamWork -Vbr $Vbr -Vb365 $Vb365) }
+    catch {
+        return [pscustomobject]@{ Scheduled = $false; At = $null; Reason = "the last Veeam activity check failed: $(Format-ShortText $_.Exception.Message 300)" }
+    }
+    $blocking = @($busy | Where-Object { "$_" -notlike 'UI:Veeam.Backup.Shell:PID*' -and "$_" -notlike 'UI:Veeam.Archiver.Shell:PID*' })
+    if ($blocking.Count -gt 0) {
+        return [pscustomobject]@{ Scheduled = $false; At = $null; Reason = "Veeam work started after the jobs were turned back on ($($blocking -join ', '))" }
+    }
+    $shutdownExe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+    $comment = 'Veeam PostgreSQL and NATS Update: restart after the PostgreSQL update, as Veeam recommends. Cancel with: shutdown /a'
+    # /d p:4:1 records a planned application-maintenance restart in the event log.
+    # Invoke-Native can only throw before shutdown.exe runs (for example when an
+    # application-control policy blocks it), so no restart was booked then.
+    try { $booked = Invoke-Native $shutdownExe @('/r', '/t', "$DelaySeconds", '/d', 'p:4:1', '/c', $comment) }
+    catch {
+        return [pscustomobject]@{ Scheduled = $false; At = $null; Reason = "shutdown.exe could not be started: $(Format-ShortText $_.Exception.Message 300)" }
+    }
+    if ($booked.ExitCode -ne 0) {
+        return [pscustomobject]@{ Scheduled = $false; At = $null; Reason = "shutdown.exe returned $($booked.ExitCode): $(Format-ShortText "$($booked.StdErr) $($booked.StdOut)" 300)" }
+    }
+    return [pscustomobject]@{ Scheduled = $true; At = (Get-Date).AddSeconds($DelaySeconds); Reason = '' }
 }
 
 function Get-RmmActionForExitCode {
@@ -3256,6 +3309,9 @@ Write-Log 'STEP 2 - Context checks' STEP
 if ($Reboot -and -not $Install) {
     Write-Log '-Reboot does nothing without -Install. This audit run will not reboot.' WARN
 }
+if ($PSBoundParameters.ContainsKey('RebootDelaySeconds') -and -not $Reboot) {
+    Write-Log '-RebootDelaySeconds does nothing without -Reboot.' WARN
+}
 if ($Recover -and ($Install -or $Reboot)) {
     Complete-Run $EXIT.PREFLIGHT 'INVALID_PARAMETERS' '-Recover is a separate operation and cannot be combined with -Install or -Reboot.'
 }
@@ -5367,7 +5423,7 @@ if ($notRunning.Count -eq 0 -and $pgFinalProblems.Count -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
-# STEP 21 - Turn the jobs back on and finish. No reboot, nothing left behind.
+# STEP 21 - Turn the jobs back on and finish. No reboot unless -Reboot asked for one.
 # ---------------------------------------------------------------------------
 Write-Log 'STEP 21 - Re-enable jobs and finish' STEP
 
@@ -5445,11 +5501,28 @@ $doneMsg = "PostgreSQL updated $runningVersion -> $target. Services verified and
 
 $successCode = Get-PolicyExitCode -Eol $script:EolBranch -UpdateAvailable $false -RebootRequired $true
 if ($Reboot) {
-    # Strict no-interruption policy: once schedules are enabled, VBR provides no
-    # global/atomic "prevent new work" barrier. Even shutdown /t 0 has a TOCTOU
-    # race. Defer the restart to the RMM's controlled change-freeze workflow.
-    $script:Report.IssueCode = 'REBOOT_REQUIRES_RMM_COORDINATION'
-    $script:Report.ActionRequired = 'RMM: enforce a Veeam change freeze, wait for all work to finish, reboot, verify LastBootUpTime, then rerun audit. Do not rerun the installer.'
-    Complete-Run $successCode 'UPDATED_REBOOT_DEFERRED_SAFETY' "$doneMsg -Reboot was requested, but no shutdown was attempted because an atomic VBR new-work barrier does not exist. Reboot through the RMM change-freeze workflow."
+    # The restart is booked last, right before the summary, so the delay covers the
+    # few seconds this run still needs and the RMM's collection of its output.
+    $restart = Invoke-DelayedReboot -DelaySeconds $RebootDelaySeconds -Vbr $hasVbr -Vb365 $hasVb365
+    if ($restart.Scheduled) {
+        $at = $restart.At.ToString('HH:mm:ss')
+        Write-Log "Server restart booked for $at ($RebootDelaySeconds seconds from now). To cancel it: shutdown /a" WARN
+        $script:Report.RebootRequired = $false
+        $script:Report.RebootScheduledAt = $restart.At.ToString('s')
+        $bookedCode = Get-PolicyExitCode -Eol $script:EolBranch -UpdateAvailable $false -RebootRequired $false
+        $bookedAction = Get-RmmActionForExitCode $bookedCode
+        $script:Report.ActionRequired = if ($bookedAction -eq 'None') {
+            "None. The server restarts at $at; after it is back, rerun the audit to confirm."
+        } else {
+            "$bookedAction The server restarts at $at; after it is back, rerun the audit to confirm."
+        }
+        Complete-Run $bookedCode 'UPDATED_REBOOT_SCHEDULED' "$doneMsg The server restarts at $at, as -Reboot asked. After it is back, rerun the audit."
+    }
+    Write-Log "-Reboot was requested, but no restart was booked: $($restart.Reason)." WARN
+    $script:Report.IssueCode = 'REBOOT_NOT_SCHEDULED'
+    # Keep the policy action for this exit code, so an EOL run (exit 8) still asks
+    # for the major-version migration ticket.
+    $script:Report.ActionRequired = "$(Get-RmmActionForExitCode $successCode) -Reboot booked no restart because $($restart.Reason)."
+    Complete-Run $successCode 'UPDATED_REBOOT_NOT_SCHEDULED' "$doneMsg -Reboot was requested, but no restart was booked because $($restart.Reason). Reboot through the RMM, verify LastBootUpTime, then rerun audit."
 }
 Complete-Run $successCode 'UPDATED_REBOOT_REQUIRED' "$doneMsg Veeam recommends restarting the server. Reboot through the RMM change-freeze workflow, verify LastBootUpTime, then rerun audit."

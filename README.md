@@ -147,8 +147,9 @@ powershell -ExecutionPolicy Bypass -File .\Update-VeeamPreReqs.ps1 -Recover
 
 The update happens in one RMM run. It waits for active Veeam work to finish naturally,
 disables schedules, performs the maintenance, verifies services, and only then re-enables
-the schedules it disabled. It never forcibly terminates a backup or restore, and it does
-not reboot the server. Reboot coordination belongs to the RMM after exit `6` or `8`.
+the schedules it disabled. It never forcibly terminates a backup or restore. It restarts
+the server only when you pass `-Reboot` (see [Rebooting](#rebooting)); otherwise the RMM
+reboots after exit `6` or `8`.
 
 ## Exit codes
 
@@ -202,15 +203,16 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | Parameter | Default | What it does |
 |---|---|---|
 | `-Install` | off | Actually do the update. Without it, audit only |
-| `-Reboot` | off | Compatibility switch only. It is accepted but safely deferred to the RMM; the script never invokes shutdown |
-| `-Recover` | off | Validate and restore captured state from an interrupted pre-installer run; post-installer use is diagnostic-only |
+| `-Reboot` | off | With `-Install`: after a fully successful update, book a Windows restart `-RebootDelaySeconds` later. See [Rebooting](#rebooting) |
+| `-RebootDelaySeconds` | `120` | Seconds from booking the restart to Windows restarting, 30 to 3600. Only used with `-Reboot` |
+| `-Recover` | off | Restore captured state from an interrupted run; if the installer finished and PostgreSQL proves healthy at the target version, finish the run |
 | `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
 | `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed |
 | `-RemoveStaleEnterpriseManagerRecord` | off | Delete a proven-stale `Veeam Backup Reporting` registry key, after exporting and verifying a `.reg` backup |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
-RMM script or policy. The independent RMM owns the maintenance window, retries, reboot,
-and post-reboot verification. `-Recover` is a separate operation and cannot be combined
+RMM script or policy. The independent RMM owns the maintenance window, retries, the reboot unless
+`-Reboot` is used, and post-reboot verification. `-Recover` is a separate operation and cannot be combined
 with `-Install` or `-Reboot`.
 
 ## How to run it from an RMM
@@ -230,7 +232,7 @@ Suggested rollout:
 2. Pilot each new PostgreSQL minor on one non-production VBR and one non-production
    VB365 server.
 3. Promote through a small production ring and a soak period before the wider fleet.
-4. Let the RMM retry exit `10`, schedule reboots for `6`/`8`, create major-migration
+4. Let the RMM retry exit `10`, schedule reboots for `6`/`8` (or use `-Reboot`), create major-migration
    tickets for `7`/`8`/`9`, and page immediately for `40`/`50`.
 
 The script intentionally has no in-script version allow-list. Rollout rings in the RMM
@@ -438,26 +440,33 @@ details for the RMM; it never terminates those sessions.
     a formerly stopped service that is now live is not stopped.
 18. Only when PostgreSQL, tuning, and services are healthy, re-enables and verifies exactly
     the schedules changed by this run.
-19. Returns exit `6` (or `8` on an EOL branch) with `RebootRequired=True`; the RMM owns the
-    controlled reboot and post-boot audit.
+19. Returns exit `6` (or `8` on an EOL branch) with `RebootRequired=True` for the RMM to
+    reboot. With `-Reboot` it books the restart itself and returns `0` (or `7`).
 
 ## Rebooting
 
 Veeam's KBs recommend restarting after the update. A successful supported-branch update
 returns exit `6`; an EOL update returns exit `8`. Both report `RebootRequired=True`.
 
-The script intentionally never calls `shutdown.exe`. Once schedules have been restored,
-VBR has no public atomic global barrier that can prevent a new backup or restore from
-starting between an idle query and Windows shutdown. Even an immediate reboot would leave
-a race and could violate the no-force rule.
-
-The legacy `-Reboot` switch is retained so existing RMM commands do not break, but it
-returns `Outcome=UPDATED_REBOOT_DEFERRED_SAFETY`, issue
-`REBOOT_REQUIRES_RMM_COORDINATION`, and exit `6`/`8`; no shutdown is attempted. The RMM
-must enforce a real Veeam change freeze, wait for work to finish, reboot, verify
+Without `-Reboot` the script never restarts the server. The RMM must reboot, verify
 `LastBootUpTime`, and rerun audit. Do not rerun the installer merely because exit `6` or
 `8` was returned. After a verified reboot, audit returns `0` on a supported branch or the
 persistent EOL result `7`.
+
+**With `-Install -Reboot`**, after a fully successful update the script books a Windows
+restart `-RebootDelaySeconds` later (default `120`), as its very last action. The delay
+lets the run finish and the RMM collect its output before Windows restarts. The run then
+returns `Outcome=UPDATED_REBOOT_SCHEDULED`, exit `0` (or `7` on an EOL branch), and the
+restart time in `RebootScheduledAt`. Cancel a booked restart with `shutdown /a`. After the
+restart, rerun audit to confirm.
+
+The trade-off: once schedules are back on, VBR has no barrier that stops new work, so a
+job that starts inside the delay is interrupted by the restart. To keep that window small,
+the script checks for Veeam work once more just before booking. If a job or restore has
+started, an Explorer is open, or that check fails, it books no restart and returns
+`Outcome=UPDATED_REBOOT_NOT_SCHEDULED` with exit `6` (or `8`) for the RMM to reboot. An
+open Veeam console does not stop the restart. The script never restarts after a failed,
+partial or rolled-back run, or when no update was needed.
 
 ## Where the evidence lives
 

@@ -36,7 +36,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Test-RegularTrustedFile','Test-ProtectedFolderAcl','Test-SafeWorkRootParent',
         'Protect-Folder','New-ProtectedDirectory','Test-WorkRootSentinel','Get-TrustedLegacyRecoveryMarker',
         'Get-ValidatedCompletedRunManifest','Initialize-WorkRoot',
-        'Get-PolicyExitCode','Get-RmmActionForExitCode',
+        'Get-PolicyExitCode','Get-RmmActionForExitCode','Invoke-DelayedReboot',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
         'Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
@@ -136,7 +136,21 @@ Check 'former WorkRoot marker cannot be bypassed' ($scriptText -match "LEGACY_WO
 Check 'cold copy does not import source ACLs' ($scriptText -match "'/COPYALL'") 'False'
 Check 'cold copy captures original DACLs' ($scriptText -match "'datadir-acl\.txt'") 'True'
 Check 'cold copy uses data-only copy flags' ($scriptText -match "'/COPY:DAT'") 'True'
-Check 'strict no-force policy never invokes shutdown.exe' ($scriptText -match 'System32[\\/]shutdown\.exe') 'False'
+# shutdown.exe may appear in exactly one place: the delayed restart that -Reboot books
+# after a fully successful update.
+$shutdownOwners = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -match 'shutdown\.exe' }, $true) | ForEach-Object {
+    $p = $_.Parent
+    while ($p -and -not ($p -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $p = $p.Parent }
+    if ($p) { $p.Name } else { '<script body>' }
+})
+Check 'shutdown.exe is used in one place only'   (@($shutdownOwners | Sort-Object -Unique) -join ',') 'Invoke-DelayedReboot'
+$delayedRebootCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-DelayedReboot' }, $true))
+Check 'the restart is booked from one place'     $delayedRebootCalls.Count 1
+Check 'the restart is booked only under -Reboot' ($scriptText -match '(?s)if \(\$Reboot\) \{\s+# The restart is booked last.*?\$restart = Invoke-DelayedReboot -DelaySeconds \$RebootDelaySeconds') 'True'
+Check 'the restart is booked after the marker is gone' ($scriptText.IndexOf('$restart = Invoke-DelayedReboot') -gt $scriptText.IndexOf("Save-RecoveryState -Stage 'COMPLETE' -InstallerStarted `$true")) 'True'
+Check 'reboot delay defaults to 120 seconds'     ($scriptText -match '\[ValidateRange\(30, 3600\)\]\[int\] \$RebootDelaySeconds = 120') 'True'
+Check 'no restart keeps the EOL migration action' ($scriptText -match '\$script:Report\.ActionRequired = "\$\(Get-RmmActionForExitCode \$successCode\) -Reboot booked no restart because') 'True'
+Check 'exit 8 action still asks for migration'   ((Get-RmmActionForExitCode 8) -match 'migration') 'True'
 Check 'audit validates Veeam APIs before idempotent exit' ($scriptText.IndexOf("STEP 6B - Validate Veeam") -lt $scriptText.IndexOf("STEP 8 - Idempotency gate")) 'True'
 Check 'tuning SQL is prepared before Veeam services are disabled' ($scriptText.IndexOf("VEEAM_TUNING_PREP_FAILED") -lt $scriptText.IndexOf('$disableFailures = @(Disable-VeeamServiceStartup)')) 'True'
 Check 'final PostgreSQL health has emergency result' ($scriptText -match "ESCALATE_NOW 'POST_UPDATE_POSTGRES_UNHEALTHY'") 'True'
@@ -981,6 +995,65 @@ Check 'no products -> idle'                  @(Get-ActiveVeeamWork -Vbr $false -
     if ($null -eq $priorStage) { Remove-Variable -Name Stage -Scope Script -ErrorAction SilentlyContinue } else { $script:Stage = $priorStage }
     $script:RecoveryState = $priorState
     Remove-Variable -Name Vb365MaintenanceSessionId, Vb365MaintenancePending -Scope Script -ErrorAction SilentlyContinue
+}
+
+'--- -Reboot books a delayed restart, only when Veeam is quiet ---'
+& {
+    $script:NativeCalls = New-Object System.Collections.ArrayList
+    $script:FakeBusy = @()
+    $script:FakeBusyThrow = $false
+    $script:FakeShutdownExit = 0
+    function Get-ActiveVeeamWork { param([bool]$Vbr, [bool]$Vb365) if ($script:FakeBusyThrow) { throw 'Veeam unreachable' }; @($script:FakeBusy) }
+    function Invoke-Native {
+        param([string]$FilePath, [string[]]$Arguments)
+        $null = $script:NativeCalls.Add(@($FilePath) + @($Arguments))
+        [pscustomobject]@{ ExitCode = $script:FakeShutdownExit; StdOut = ''; StdErr = $(if ($script:FakeShutdownExit) { 'A system shutdown has already been scheduled.' } else { '' }) }
+    }
+
+    $r = Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false
+    $call = @($script:NativeCalls[0])
+    Check 'quiet server: restart is booked'       $r.Scheduled 'True'
+    Check 'it calls shutdown.exe'                 ($call[0] -match 'System32\\shutdown\.exe$') 'True'
+    Check 'it restarts, not shuts down'           ($call -contains '/r') 'True'
+    Check 'it waits the delay'                    (($call -join ' ') -match '/t 120 ') 'True'
+    Check 'it records a planned reason'           (($call -join ' ') -match '/d p:4:1') 'True'
+    Check 'it says how to cancel'                 (($call -join ' ') -match 'shutdown /a') 'True'
+    Check 'the restart time is about 2 min away'  ([math]::Round(($r.At - (Get-Date)).TotalSeconds / 10) * 10) 120
+
+    $script:NativeCalls.Clear(); $script:FakeBusy = @('VBR:Backup:Nightly:Working')
+    $r = Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false
+    Check 'a running job stops the restart'       $r.Scheduled 'False'
+    Check 'and names the job'                     ($r.Reason -match 'VBR:Backup:Nightly:Working') 'True'
+    Check 'nothing is booked then'                $script:NativeCalls.Count 0
+
+    $script:FakeBusy = @('UI:Veeam.Exchange.Explorer:PID7')
+    Check 'an open Explorer stops the restart'    (Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false).Scheduled 'False'
+
+    $script:NativeCalls.Clear(); $script:FakeBusy = @('UI:Veeam.Backup.Shell:PID9', 'UI:Veeam.Archiver.Shell:PID8')
+    Check 'an open console does not stop it'      (Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $true).Scheduled 'True'
+
+    $script:NativeCalls.Clear(); $script:FakeBusy = @(); $script:FakeBusyThrow = $true
+    $r = Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false
+    Check 'a failed activity check stops it'      $r.Scheduled 'False'
+    Check 'and says why'                          ($r.Reason -match 'activity check failed: Veeam unreachable') 'True'
+    Check 'nothing is booked after a failed check' $script:NativeCalls.Count 0
+
+    $script:FakeBusyThrow = $false; $script:FakeShutdownExit = 1190
+    $r = Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false
+    Check 'a refused booking is not reported as booked' $r.Scheduled 'False'
+    Check 'the refusal reason is kept'            ($r.Reason -match 'returned 1190: A system shutdown has already been scheduled') 'True'
+
+    Check 'delay below 30 seconds is refused'     (Throws { Invoke-DelayedReboot -DelaySeconds 5 -Vbr $true -Vb365 $false }) 'True'
+
+    # Application control can stop shutdown.exe from starting at all. That is "not
+    # booked", never an unhandled error that pages an operator about a healthy server.
+    $script:FakeShutdownExit = 0
+    function Invoke-Native { param([string]$FilePath, [string[]]$Arguments) throw 'Program shutdown.exe failed to run: Access is denied' }
+    $r = $null
+    Check 'a blocked shutdown.exe does not throw'  (Throws { $script:r = Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false }) 'False'
+    $r = Invoke-DelayedReboot -DelaySeconds 120 -Vbr $true -Vb365 $false
+    Check 'a blocked shutdown.exe is not booked'   $r.Scheduled 'False'
+    Check 'and says it could not start'           ($r.Reason -match 'could not be started: Program shutdown\.exe failed to run') 'True'
 }
 
 $jobRecords = @(
