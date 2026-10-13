@@ -3,8 +3,9 @@
 Patches the PostgreSQL engine under **Veeam Backup & Replication (VBR)** and
 **Veeam Backup for Microsoft 365 (VB365 / "VBM")** on Windows. Built to run from an RMM.
 
-It updates PostgreSQL only. When the NATS server is installed, it stops NATS before the
-update and starts it again afterwards, but it does not update NATS itself.
+It updates PostgreSQL. On VB365 it also updates NATS, the message server VB365 8 uses for
+its job queue. Both are **updates, never upgrades**: PostgreSQL stays on its major version,
+and NATS stays on its 2.x line. See [Updating NATS (VB365)](#updating-nats-vb365).
 
 ## Why this exists
 
@@ -161,7 +162,7 @@ exact values:
 | Code | Meaning | Action |
 |---|---|---|
 | `0` | Healthy, with no outstanding RMM action | None |
-| `5` | Supported branch: audit found a minor update | Schedule `-Install` through the rollout ring |
+| `5` | Supported branch: audit found a PostgreSQL minor update or a NATS update | Schedule `-Install` through the rollout ring |
 | `6` | Supported branch: update succeeded; reboot required | Schedule and verify a reboot |
 | `7` | PostgreSQL branch is EOL | Open or maintain a major-version migration ticket |
 | `8` | EOL branch and reboot required | Schedule a reboot and maintain the migration ticket |
@@ -169,7 +170,7 @@ exact values:
 | `10` | Safe transient condition | Retry later; no backup or restore was forcibly stopped |
 | `11` | Unsupported or excluded topology | Handle manually; do not repeatedly retry as a transient failure |
 | `20` | Pre-flight failed | Investigate before retrying |
-| `30` | EnterpriseDB page, download, size, or signature check failed | Investigate the download path; nothing was installed |
+| `30` | EnterpriseDB page, download, size, or signature check failed, or the NATS download or its pinned SHA256 check failed | Investigate the download path; nothing was installed |
 | `40` | **Post-change failure, unhealthy service, mandatory tuning failure, or recovery needs an operator** | **Page an operator and read the RMM issue fields** |
 | `50` | **PostgreSQL is missing, down, unqueryable, or reports the wrong version after change/tuning/recovery diagnosis** | **Page an operator immediately and use the recovery evidence** |
 
@@ -178,7 +179,8 @@ an EOL server with a post-update service failure returns `40`, not `8`.
 
 The console summary and `last-result.json` include `ExitCode`, `IssueCode`,
 `ActionRequired`, `JobsLeftDisabled`, `UnhealthyServices`, `ServicesStarted`,
-`ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, and `Detail`. `ServicesStarted` lists
+`ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, `Detail`, and the NATS fields
+`NatsInstalled`, `NatsTarget`, `NatsStatus` and `NatsDetail`. `ServicesStarted` lists
 stopped automatic Veeam services the run started to rescue a failed configuration backup,
 `ConsolesClosed` lists the Veeam consoles it closed, and `Vb365SyncStuck` names any VB365
 organisation whose data sync is stuck: VB365 needs attention there.
@@ -259,6 +261,7 @@ to your RMM. There is no `-ConfigPath` parameter and no external settings file i
 | `jobWaitTimeoutMinutes` | `720` | Maximum time to wait for active Veeam work to finish naturally |
 | `installerTimeoutMinutes` | `120` | Maximum unattended wait for the EnterpriseDB installer; it is not forcibly killed on timeout |
 | `retentionDays` | `30` | Minimum age before completed logs and recovery sets become eligible for deletion |
+| `updateNats` | `true` | VB365 only. `true`: `-Install` also updates NATS when a same-line update is due. `false`: NATS is only reported (`NatsStatus=UPDATES_OFF`) |
 
 The PostgreSQL target is **not** a maintained setting. On every default run, the script:
 
@@ -445,6 +448,122 @@ details for the RMM; it never terminates those sessions.
 19. Returns exit `6` (or `8` on an EOL branch) with `RebootRequired=True` for the RMM to
     reboot. With `-Reboot` it books the restart itself and returns `0` (or `7`).
 
+## Updating NATS (VB365)
+
+VB365 8 keeps its job queue in a NATS server: the `nats-server` Windows service. A VB365
+upgrade never updates NATS. Veeam leaves that to you and documents the steps in
+[KB4742](https://www.veeam.com/kb4742). The script follows those steps, with backups, checks
+and an automatic rollback added. VBR does not use NATS, so on VBR `NatsStatus=NOT_APPLICABLE`.
+
+**An update, never an upgrade.** Veeam supports an exact list of NATS versions per VB365
+release, not a range
+([system requirements](https://helpcenter.veeam.com/docs/vbo365/guide/vbo_system_requirements.html)).
+The script moves NATS only to the newest version on that list that is on the **same 2.x line**
+as the installed one. A move to another line changes the message-store format and has no
+documented way back, so the script never does it.
+
+For VB365 8.6 the list is 2.10.18, 2.10.22, 2.10.28, 2.12.5 and 2.12.8:
+
+| Installed | Result |
+|---|---|
+| 2.10.18 or 2.10.22 | Update to 2.10.28 |
+| 2.12.5, 2.12.6 or 2.12.7 | Update to 2.12.8 |
+| 2.10.28 or 2.12.8 | `CURRENT`, nothing to do |
+| 2.10.29, 2.12.9 or later on a line | `AHEAD`, left alone. Never downgraded |
+| 2.11.x, 2.14.x, any other line | `UNLISTED`, left alone |
+
+**One change per run.** When PostgreSQL also needs an update, `-Install` updates PostgreSQL
+and reports `NatsStatus=UPDATE_PENDING`. The next `-Install` run updates NATS. Each change
+then has its own outage and its own rollback, and you always know which one caused a problem.
+
+**The download is checked against a pinned SHA256.** NATS publishes no signature. The script
+holds the SHA256 of every package it may install, in `Get-NatsPolicy`. A download that does
+not match is deleted, and the run returns exit `30` with nothing changed.
+
+**When Veeam lists a new NATS version**, add it to `Get-NatsPolicy` in the script: the
+version to the VB365 release's list, and the SHA256 of its `windows-amd64.zip` from the
+release's `SHA256SUMS` file on [GitHub](https://github.com/nats-io/nats-server/releases).
+A version on the list without a hash is reported as `UNPINNED` and never installed. A newer
+VB365 release gets no NATS changes until its list is added.
+
+### What a NATS update does
+
+The audit reads all of this and changes nothing. An update is only planned when every
+check passes; anything the script cannot prove leaves NATS alone, with the reason in
+`NatsDetail`, and never blocks a PostgreSQL update.
+
+* The `nats-server` service runs `nats-server.exe` from a folder directly under
+  `C:\Program Files\NATS`, with exactly `-c <config file>`.
+* `nats-server --version`, the folder name (when it carries a version), and the version
+  NATS reports to a client on its port all agree.
+* The config file names exactly one `store_dir`, uses no `include`, `cluster`, `gateway` or
+  `leafnodes`, and the store is a local folder outside `WorkRoot`.
+* `Config.xml` and `Proxy.xml` send VB365 to NATS on this server, on the port in the config
+  file. No other machine is connected to NATS.
+
+`-Install` then:
+
+1. Downloads `nats-server-v<version>-windows-amd64.zip` from GitHub, checks its SHA256,
+   extracts only `nats-server.exe`, and runs it with `--version` and `-t` (config check
+   only). Nothing has changed yet.
+2. Waits for VB365 work to finish, disables the jobs, and starts VB365 maintenance mode, as
+   for a PostgreSQL update.
+3. Stops every `Veeam*` service (Proxy first), then NATS. PostgreSQL keeps running.
+4. Backs up the service's registry key, the config file, the store's permissions, and the
+   whole message store, and checks that the copy holds the same number of files and bytes.
+5. Copies the new `nats-server.exe` into a new version folder beside the old one, and points
+   the service at it through the Windows service manager, as KB4742 does with `sc.exe`.
+   The old folder stays.
+6. Starts NATS on its own and checks the version clients get. Then starts VB365, waits 90
+   seconds, and checks every service, PostgreSQL, the VB365 PowerShell connection, and,
+   when VB365 was connected to NATS before, that it connects again.
+7. Ends maintenance mode and turns the jobs back on. Returns exit `0` (or `7` on an EOL
+   PostgreSQL branch) with `Outcome=NATS_UPDATED`. A NATS update needs no restart, so
+   `-Reboot` books none.
+
+**If something fails**, the old NATS goes back automatically and the run returns exit `20`
+(`NATS_UPDATE_FAILED`, `NatsStatus=UPDATE_FAILED_REVERTED`):
+
+* Before VB365 used the new version, the service points back at the old program. If the new
+  version started, the message store copy is put back too.
+* After VB365 used it, VB365 is stopped and the service points back at the old program, but
+  the store is **kept**. Old messages put back could make VB365 do work twice. The old
+  version on the same line reads the store as it is.
+
+If the rollback itself fails, the script starts nothing on a half-switched NATS: the jobs
+stay disabled, Veeam services are not started again, and the run returns exit `40`. `ActionRequired` names the old program, the registry backup and the store
+copy. Fix the problem, then run `-Recover`: it tries the rollback again.
+
+`-Recover` on an interrupted NATS run puts the old NATS back, unless VB365 was already
+started on the new version and NATS answers at that version. Then it keeps the new version
+and finishes the run (`RECOVERED_NATS_UPDATED`). If someone started Veeam services by hand
+before VB365 ever used the new version, it changes nothing and asks an operator to stop them
+first. NATS runs write recovery state version 2, so an older copy of this script refuses to
+recover one instead of guessing.
+
+| `NatsStatus` | What it means |
+|---|---|
+| `NOT_APPLICABLE` | Not a VB365 server |
+| `NOT_LOCAL` | No `nats-server` service on this server |
+| `NOT_RUNNING` | `nats-server` is stopped or disabled; it is only updated while it runs normally |
+| `CURRENT` | The newest version Veeam lists on its line |
+| `UPDATE_AVAILABLE` | An update is due. Audit returns exit `5` (or `9`) |
+| `UPDATE_PENDING` | Due, but this run updated PostgreSQL. The next `-Install` run updates NATS |
+| `UPDATES_OFF` | Due, but `updateNats` is `false` |
+| `UPDATED` | This run updated NATS |
+| `UPDATE_FAILED_REVERTED` | The update failed and the old version is back |
+| `NOT_UPDATED` | The run stopped before NATS was changed |
+| `UPDATE_FAILED` | The run stopped while NATS was half-switched. Read `ActionRequired` |
+| `AHEAD` / `UNLISTED` | Not on Veeam's list, or nothing on its line to update to. Left alone |
+| `UNPINNED` | Veeam lists a newer version, but the script has no hash for it yet |
+| `POLICY_UNKNOWN_VB365` | The script has no NATS list for this VB365 release |
+| `REMOTE_CLIENTS` | Another machine is connected to NATS |
+| `UNRECOGNISED_LAYOUT` | NATS is not set up the way the script expects. `NatsDetail` says what |
+
+**Before the first NATS update**, run the audit on the VB365 servers and read `NatsStatus`
+and `NatsDetail`. The script was built from Veeam's documentation, not from a live VB365
+NATS install: an `UNRECOGNISED_LAYOUT` result names the part that differs.
+
 ## Rebooting
 
 Veeam's KBs recommend restarting after the update. A successful supported-branch update
@@ -460,7 +579,10 @@ restart `-RebootDelaySeconds` later (default `120`), as its very last action. Th
 lets the run finish and the RMM collect its output before Windows restarts. The run then
 returns `Outcome=UPDATED_REBOOT_SCHEDULED`, exit `0` (or `7` on an EOL branch), and the
 restart time in `RebootScheduledAt`. Cancel a booked restart with `shutdown /a`. After the
-restart, rerun audit to confirm.
+restart, rerun audit to confirm. A NATS-only update needs no restart, so `-Reboot` books
+none. When a PostgreSQL update booked a restart and a NATS update is still due, the run
+returns exit `5` (or `9`) instead of `0` (or `7`), so the RMM schedules the next `-Install`
+run.
 
 The trade-off: once schedules are back on, VBR has no barrier that stops new work, so a
 job that starts inside the delay is interrupted by the restart. To keep that window small,
@@ -495,6 +617,15 @@ C:\ProgramData\VeeamPgUpdate\
     nats-service-state.json       when nats-server is installed
     pg-tuning.sql
     installer-*.log
+  runs\<timestamp>\               a NATS update run instead holds:
+    nats\                          the downloaded zip and the checked program, removed on success
+    backup\
+      Config.xml, Proxy.xml
+      nats\
+        nats-server-service.reg     the service's registry key
+        nats-server.conf            the config file (it holds the NATS credentials)
+        store\                      copy of the whole message store
+        store-acl.txt               the store's original permissions
 ```
 
 **The WorkRoot and newly created evidence tree are locked to SYSTEM and Administrators.**
@@ -570,6 +701,7 @@ Use `-Recover` for an interrupted run:
 
 * It validates that the marker and versioned `recovery-state.json` resolve inside this
   work root and are trusted recovery data.
+* For a NATS update run, see [Updating NATS (VB365)](#updating-nats-vb365).
 * If the recorded installer-started flag is false and the stage is `JOBS_DISABLED` or
   `SERVICES_STOPPED`, it restores and verifies captured PostgreSQL, NATS, Veeam service,
   and job state. Successful recovery returns exit `0` and removes the marker.
@@ -736,6 +868,9 @@ tested profile that protects every database, proxy, service, and schedule involv
 
 * **No checksums.** EnterpriseDB publishes none. The Authenticode signature is the only
   authenticity control. Behind a TLS-inspecting proxy, test it before fleet rollout.
+* **NATS has no signature.** The pinned SHA256 is the only authenticity control, so a new
+  NATS version needs a script change. NATS updates cover a single-server NATS only: no
+  cluster, gateway, leaf node, or client on another machine.
 * **Pilot first.** VB365 support needs VB365 8.6 or later. The unit tests pass on both
   PowerShell editions. **Pilot each new product, version and PowerShell edition on one
   non-production server before fleet rollout.**

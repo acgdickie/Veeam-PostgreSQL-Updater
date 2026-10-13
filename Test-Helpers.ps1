@@ -50,7 +50,12 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-VeeamServiceState','Disable-VeeamServiceStartup','Restore-VeeamServiceState',
         'Add-ReportListItem','Get-VeeamConsoleProcesses','Close-VeeamConsoleProcesses','Test-OnlyConsoleBlockers',
         'Start-StoppedAutomaticVeeamServices','Invoke-VbrConfigBackupAttempt','Invoke-RecoveryPgTuning',
-        'Add-RunSideEffectNotes'
+        'Add-RunSideEffectNotes',
+        'Get-NatsPolicy','Get-Vb365ReleaseKey','Resolve-NatsTarget','ConvertFrom-NatsImagePath','ConvertFrom-NatsVersionText',
+        'Read-NatsConfText','Get-NatsConfFacts','ConvertFrom-NatsConnectionString','ConvertFrom-NatsInfoLine','Get-NatsInfoVersion',
+        'Wait-NatsInfoVersion','Get-NatsClientSummary','Test-NatsStorePathSafe','Test-NatsZipEntryNames','Expand-NatsPackage',
+        'Get-FileSha256','Get-NatsDiscovery','Set-NatsStage','Set-NatsServicePath','Stop-ServiceAndWait','Test-NatsRunningAt',
+        'Restore-NatsStore','Restore-NatsInstallation','Get-NatsManualRevertAction','Stop-ServicesInOrder','Get-NatsRunFacts'
 foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($want -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -238,7 +243,8 @@ Check 'duplicate branch throws' (Throws {
 '--- Get-DefaultConfig: the built-in settings ---'
 $d = Get-DefaultConfig
 Check 'built-in JSON parses'          ($null -ne $d)  'True'
-Check 'only current settings remain'  (@($d.PSObject.Properties.Name | Sort-Object) -join ',')  'installerTimeoutMinutes,jobWaitTimeoutMinutes,retentionDays'
+Check 'only current settings remain'  (@($d.PSObject.Properties.Name | Sort-Object) -join ',')  'installerTimeoutMinutes,jobWaitTimeoutMinutes,retentionDays,updateNats'
+Check 'NATS updates are on by default' $d.updateNats 'True'
 Check 'approvedTargets retired'       (@($d.PSObject.Properties.Name) -contains 'approvedTargets')   'False'
 Check 'supportedBranches retired'     (@($d.PSObject.Properties.Name) -contains 'supportedBranches') 'False'
 Check 'branchFloors retired'          (@($d.PSObject.Properties.Name) -contains 'branchFloors')       'False'
@@ -475,6 +481,10 @@ if ($isAdmin) {
         $copiedRun = Join-Path $base '20260917-010203-004-2469'; New-Item -ItemType Directory $copiedRun | Out-Null
         Write-AtomicJson -Path (Join-Path $copiedRun 'recovery-state.json') -InputObject $completedState
         Check 'copied COMPLETE manifest is rejected' ($null -eq (Get-ValidatedCompletedRunManifest $copiedRun)) 'True'
+        $natsRunId = '20260917-010203-004-2470'
+        $natsCompleted = Join-Path $base $natsRunId; New-Item -ItemType Directory $natsCompleted | Out-Null
+        Write-AtomicJson -Path (Join-Path $natsCompleted 'recovery-state.json') -InputObject ([ordered]@{ SchemaVersion=2; RunId=$natsRunId; RunDir=$natsCompleted; Stage='COMPLETE'; LogPath=''; Change='NATS' })
+        Check 'a completed NATS run can be purged' ($null -ne (Get-ValidatedCompletedRunManifest $natsCompleted)) 'True'
 
         # A previously managed root becomes unsafe if any child is a junction.
         $junctionRoot = Join-Path $base 'junction-root'
@@ -1802,7 +1812,9 @@ Check 'Complete-Run adds the side-effect notes'  ($scriptText -match '\$stateNot
 Check 'state note is never cut from Detail'      ($scriptText -match 'Format-ShortText \$Detail \$detailMax') 'True'
 # The service snapshot is taken AFTER the configuration backup, so a service this
 # run started is recorded as running and STEP 20 leaves it running.
-Check 'snapshot is taken after the retry'        ($scriptText.IndexOf('$cfgAttempt = Invoke-VbrConfigBackupAttempt') -lt $scriptText.IndexOf('$script:VeeamServices = @(Get-VeeamServiceState)')) 'True'
+# LastIndexOf: the NATS run takes its own snapshot earlier in the file, and VB365 has
+# no configuration backup to retry.
+Check 'snapshot is taken after the retry'        ($scriptText.IndexOf('$cfgAttempt = Invoke-VbrConfigBackupAttempt') -lt $scriptText.LastIndexOf('$script:VeeamServices = @(Get-VeeamServiceState)')) 'True'
 
 '--- Open Veeam consoles are closed, never waited for; Explorers never ---'
 & {
@@ -1939,7 +1951,7 @@ Check 'nothing blocks: nothing to close'         (Test-OnlyConsoleBlockers @()) 
 
 $idleWaits = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Wait-VeeamIdle' }, $true))
 $idleWaitsThatClose = @($idleWaits | Where-Object { @($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'CloseConsoles' }).Count -gt 0 })
-Check 'every idle wait closes consoles'          "$($idleWaitsThatClose.Count)/$($idleWaits.Count)" '6/6'
+Check 'every idle wait closes consoles'          "$($idleWaitsThatClose.Count)/$($idleWaits.Count)" '9/9'
 # Audit mode must change nothing: its one activity read is before the audit exit,
 # and nothing that closes a console runs before that exit.
 $auditExitToken = @($toks | Where-Object { $_.Kind -eq 'Comment' -and $_.Text.Trim() -eq '# AUDIT MODE STOPS HERE' })
@@ -1956,10 +1968,12 @@ $consoleClosers = @($ast.FindAll({
     [pscustomobject]@{ Name = $_.GetCommandName(); Owner = $(if ($p) { $p.Name } else { '<script body>' }); Offset = $_.Extent.StartOffset }
 })
 $closersBeforeAuditExit = @($consoleClosers | Where-Object { $_.Owner -eq '<script body>' -and $_.Offset -lt $auditExit })
-# Inside functions, only the idle wait closes, and only recovery (never audit) waits that way.
+# Inside functions, only the idle wait closes, and only recovery and the NATS -Install run
+# (never audit) close that way. Audit exits before the NATS run starts (checked below).
 $strayClosers = @($consoleClosers | Where-Object { $_.Owner -ne '<script body>' -and -not (
     ($_.Name -eq 'Close-VeeamConsoleProcesses' -and $_.Owner -eq 'Wait-VeeamIdle') -or
-    ($_.Name -eq 'Wait-VeeamIdle' -and $_.Owner -eq 'Invoke-ExplicitRecovery')) })
+    ($_.Name -eq 'Wait-VeeamIdle' -and $_.Owner -eq 'Invoke-ExplicitRecovery') -or
+    $_.Owner -eq 'Invoke-NatsOnlyUpdate') })
 Check 'the audit exit marker exists once'        ($auditExit -gt 0) 'True'
 Check 'audit never closes a console'             $closersBeforeAuditExit.Count 0
 Check 'no closer hides in another function'      (@($strayClosers | ForEach-Object { "$($_.Name)@$($_.Owner)" }) -join ',') ''
@@ -2379,6 +2393,702 @@ try {
     Remove-Item -LiteralPath $testKeyPath -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $testBackup -Force -ErrorAction SilentlyContinue
 }
+
+'--- NATS: same-line update policy (an update, never an upgrade) ---'
+$natsPolicy = Get-NatsPolicy
+$natsList = @($natsPolicy.SupportedByVb365['8.6'])
+function Get-TestNatsTarget([string] $Installed) { Resolve-NatsTarget -Installed $Installed -Supported $natsList -PackageSha256 $natsPolicy.PackageSha256 }
+Check 'VB365 8.6 list is exact'              ($natsList -join ',') '2.10.18,2.10.22,2.10.28,2.12.5,2.12.8'
+Check 'every pinned package is on the list'  (@($natsPolicy.PackageSha256.Keys | Where-Object { $natsList -notcontains $_ }).Count) 0
+Check 'pinned hashes are SHA256 hex'         (@($natsPolicy.PackageSha256.Values | Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }).Count) 0
+Check '2.10.28 hash is the published one'    $natsPolicy.PackageSha256['2.10.28'] '98b8571231b00ebe0445cc7f317f6425c1fbc2edecd455949d37022e04281657'
+Check '2.12.8 hash is the published one'     $natsPolicy.PackageSha256['2.12.8'] '61836ff8d0cecbb773faf7daa22f5212b7ed3ab5a0c58c12b013d67d64edd6cc'
+$t = Get-TestNatsTarget '2.10.18'; Check '2.10.18 -> 2.10.28'               "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.10.28'
+$t = Get-TestNatsTarget '2.10.22'; Check '2.10.22 -> 2.10.28'               "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.10.28'
+Check '2.10.22 gets the pinned hash'         (Get-TestNatsTarget '2.10.22').Sha256 $natsPolicy.PackageSha256['2.10.28']
+$t = Get-TestNatsTarget '2.10.28'; Check '2.10.28 is current, never 2.12'   "$($t.Status)|$($t.Target)" 'CURRENT|'
+$t = Get-TestNatsTarget '2.10.29'; Check '2.10.29 is ahead, never downgraded' "$($t.Status)|$($t.Target)" 'AHEAD|'
+$t = Get-TestNatsTarget '2.12.5';  Check '2.12.5 -> 2.12.8'                 "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.12.8'
+$t = Get-TestNatsTarget '2.12.6';  Check 'unlisted 2.12.6 -> 2.12.8'        "$($t.Status) $($t.Target)" 'UPDATE_AVAILABLE 2.12.8'
+$t = Get-TestNatsTarget '2.12.8';  Check '2.12.8 is current'                $t.Status 'CURRENT'
+$t = Get-TestNatsTarget '2.12.9';  Check '2.12.9 is ahead'                  $t.Status 'AHEAD'
+$t = Get-TestNatsTarget '2.11.4';  Check '2.11.4 has no line to update on'  "$($t.Status)|$($t.Target)" 'UNLISTED|'
+$t = Get-TestNatsTarget '2.14.0';  Check '2.14.0 is left alone'             "$($t.Status)|$($t.Target)" 'UNLISTED|'
+$t = Resolve-NatsTarget -Installed '2.10.22' -Supported @('2.10.22','2.10.30') -PackageSha256 @{}
+Check 'listed but unpinned is never installed' "$($t.Status) $($t.Target) [$($t.Sha256)]" 'UNPINNED 2.10.30 []'
+$crossLine = @(foreach ($v in @('2.10.18','2.10.22','2.10.28','2.10.29','2.11.0','2.12.5','2.12.6','2.12.7','2.12.8','2.14.1')) {
+    $r = Get-TestNatsTarget $v
+    if ($r.Target -and (([version]$r.Target).Major -ne ([version]$v).Major -or ([version]$r.Target).Minor -ne ([version]$v).Minor)) { $v }
+    if ($r.Target -and $r.Status -eq 'UPDATE_AVAILABLE' -and [version]$r.Target -le [version]$v) { "$v down" }
+})
+Check 'no version moves to another line or down' ($crossLine -join ',') ''
+Check 'VB365 8.6 file version maps to 8.6'   (Get-Vb365ReleaseKey '13.6.0.0') '8.6'
+Check 'VB365 8.6 build number maps to 8.6'   (Get-Vb365ReleaseKey '8.6.0.1102') '8.6'
+Check 'a later VB365 has no list yet'        (Get-Vb365ReleaseKey '13.7.0.0') ''
+Check '13.60 is not 13.6'                    (Get-Vb365ReleaseKey '13.60.0.0') ''
+Check 'unknown VB365 version has no list'    (Get-Vb365ReleaseKey 'Unknown') ''
+
+'--- NATS: service command line ---'
+$natsRootT = 'C:\Program Files\NATS'
+$img = ConvertFrom-NatsImagePath -PathName '"C:\Program Files\NATS\nats-server-v2.10.22-windows-amd64\nats-server.exe" -c "C:\ProgramData\NATS\nats-server.conf"' -NatsRoot $natsRootT
+Check 'program read'                 $img.Exe 'C:\Program Files\NATS\nats-server-v2.10.22-windows-amd64\nats-server.exe'
+Check 'config file read'             $img.ConfPath 'C:\ProgramData\NATS\nats-server.conf'
+Check 'folder version read'          $img.FolderVersion '2.10.22'
+Check 'arguments kept exactly'       $img.Arguments ' -c "C:\ProgramData\NATS\nats-server.conf"'
+$img = ConvertFrom-NatsImagePath -PathName '"C:\Program Files\NATS\nats\nats-server.exe" --config=C:\ProgramData\NATS\nats-server.conf' -NatsRoot $natsRootT
+Check '--config= form read'          $img.ConfPath 'C:\ProgramData\NATS\nats-server.conf'
+Check 'unversioned folder is allowed' $img.FolderVersion ''
+$img = ConvertFrom-NatsImagePath -PathName 'C:\Program Files\NATS\nats-server-v2.10.22-windows-amd64\nats-server.exe -c C:\ProgramData\NATS\nats-server.conf' -NatsRoot $natsRootT
+Check 'unquoted program path read'   $img.Exe 'C:\Program Files\NATS\nats-server-v2.10.22-windows-amd64\nats-server.exe'
+function Get-TestImageError([string] $PathName) { try { [void](ConvertFrom-NatsImagePath -PathName $PathName -NatsRoot $natsRootT); '' } catch { $_.Exception.Message } }
+$e = Get-TestImageError '"C:\Program Files\NATS\v\nats-server.exe" -c "C:\x\n.conf" --pass s3cretValue'
+Check 'extra flag refused'           ($e -match 'flags found: -c --pass') 'True'
+Check 'flag value never shown'       ($e -match 's3cretValue') 'False'
+Check 'no config file refused'       ((Get-TestImageError '"C:\Program Files\NATS\v\nats-server.exe"') -match 'not exactly -c') 'True'
+Check 'another program refused'      ((Get-TestImageError '"C:\Program Files\NATS\v\other.exe" -c "C:\x\n.conf"') -match 'not nats-server\.exe') 'True'
+Check 'program outside NATS refused' ((Get-TestImageError '"C:\Tools\nats\nats-server.exe" -c "C:\x\n.conf"') -match 'not in a version folder') 'True'
+Check 'program nested deeper refused' ((Get-TestImageError '"C:\Program Files\NATS\a\b\nats-server.exe" -c "C:\x\n.conf"') -match 'not in a version folder') 'True'
+Check 'relative config refused'      ((Get-TestImageError '"C:\Program Files\NATS\v\nats-server.exe" -c nats.conf') -match 'not a local absolute path') 'True'
+Check 'version line read'            (ConvertFrom-NatsVersionText "nats-server: v2.10.22`r`n") '2.10.22'
+Check 'other text is no version'     (ConvertFrom-NatsVersionText 'nats-server version 2.10.22') ''
+Check 'empty text is no version'     (ConvertFrom-NatsVersionText '') ''
+
+'--- NATS: config file ---'
+$conf1 = @'
+# Example layout, as the VB365 installer writes it
+listen: 127.0.0.1:4222
+http_port: 8222
+jetstream {
+    store_dir: "C:\\ProgramData\\Veeam\\Backup365\\nats"
+    max_memory_store: 1GB   # a comment after a value
+}
+authorization {
+    user: admin
+    password: "$2a$11$abc{}#not-a-comment"
+}
+log_file: 'C:\ProgramData\NATS\nats.log'
+websocket { port: 8080, no_tls: true }
+accounts: { A: { users: [ { user: a, password: "x]}" } ] } }
+'@
+$f = Get-NatsConfFacts $conf1
+Check 'store_dir read and unescaped' ($f.StoreDirs -join '|') 'C:\ProgramData\Veeam\Backup365\nats'
+Check 'port from listen, not websocket' $f.Port 4222
+Check 'version asked on the listen address' $f.ProbeHost '127.0.0.1'
+Check 'nothing refused'              ($f.Refused -join ',') ''
+$entries = @(Read-NatsConfText $conf1)
+Check 'block path recorded'          (@($entries | Where-Object { $_.Key -eq 'store_dir' })[0].Path) 'jetstream.store_dir'
+Check 'braces in a password are text' (@($entries | Where-Object { $_.Path -eq 'authorization.password' }).Count) 1
+Check 'a list is skipped whole'      (@($entries | Where-Object { $_.Path -eq 'accounts.A.users' })[0].Kind) 'List'
+$f = Get-NatsConfFacts "port = 4333`njetstream { store_dir = `"D:/nats-store/js`", max_file_store: 10G }"
+Check 'one-line block store_dir'     ($f.StoreDirs -join '|') 'D:/nats-store/js'
+Check 'port key read'                $f.Port 4333
+$f = Get-NatsConfFacts "jetstream { store_dir: 'C:\data\nats' }`ninclude ./auth.conf`ncluster { name: c1, listen: 0.0.0.0:6222 }`nleafnodes { remotes = [ { url: `"nats://hub:7422`" } ] }"
+Check 'include, cluster, leafnodes refused' ($f.Refused -join ',') 'cluster,include,leafnodes'
+Check 'cluster listen is not the client port' $f.Port 4222
+$f = Get-NatsConfFacts "jetstream { store_dir: 'C:\a\b' }`nother { store_dir: 'C:\c\d' }"
+Check 'two store_dir settings counted' $f.StoreDirs.Count 2
+$f = Get-NatsConfFacts "port: 4222`nlisten: 0.0.0.0:4333`njetstream { store_dir: 'C:\a\b' }"
+Check 'port and listen disagree'     ($f.Refused -join ',') 'port and listen disagree'
+$f = Get-NatsConfFacts "listen: 0.0.0.0:4222`njetstream { store_dir: 'C:\a\b' }"
+Check 'any-address listen is asked on 127.0.0.1' $f.ProbeHost '127.0.0.1'
+$f = Get-NatsConfFacts "listen: 10.20.30.40:4222`njetstream { store_dir: 'C:\a\b' }"
+Check 'a specific listen address is asked there' $f.ProbeHost '10.20.30.40'
+$f = Get-NatsConfFacts "jetstream { store_dir: 'C:\a\b' }"
+Check 'no port means 4222'           $f.Port 4222
+Check 'unbalanced braces refused'    (Throws { Get-NatsConfFacts "jetstream {`n store_dir: 'C:\a\b'" }) 'True'
+Check 'unterminated string refused'  (Throws { Get-NatsConfFacts "jetstream { store_dir: `"C:\\a\\b }" }) 'True'
+Check 'a stray brace refused'        (Throws { Get-NatsConfFacts "}`n" }) 'True'
+
+'--- NATS: VB365 connection string and INFO line ---'
+$c = ConvertFrom-NatsConnectionString 'nats://admin:AbC+/9z=@VBM-PILOT:4222?passwordEncrypted'
+Check 'host read'                    $c.Host 'VBM-PILOT'
+Check 'port read'                    $c.Port 4222
+Check 'default port 4222'            (ConvertFrom-NatsConnectionString 'nats://localhost').Port 4222
+Check 'IPv6 host read'               (ConvertFrom-NatsConnectionString 'nats://u:p@[::1]:4223').Host '::1'
+function Get-TestConnError([string] $Text) { try { [void](ConvertFrom-NatsConnectionString $Text); '' } catch { $_.Exception.Message } }
+$e = Get-TestConnError 'nats://admin:Secret1@a:4222,nats://admin:Secret1@b:4222'
+Check 'a server list is refused'     ($e -match 'more than one') 'True'
+Check 'the password is never shown'  ($e -match 'Secret1') 'False'
+Check 'not nats:// refused'          ((Get-TestConnError 'http://a:4222') -ne '') 'True'
+Check 'INFO version read'            (ConvertFrom-NatsInfoLine 'INFO {"server_id":"N","version":"2.10.28","proto":1,"jetstream":true}') '2.10.28'
+Check 'an error line is no version'  (ConvertFrom-NatsInfoLine "-ERR 'Authorization Violation'") ''
+Check 'broken JSON is no version'    (ConvertFrom-NatsInfoLine 'INFO {broken') ''
+$listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+$listener.Start()
+$infoPort = $listener.LocalEndpoint.Port
+try {
+    $serverPs = [powershell]::Create()
+    [void]$serverPs.AddScript({
+        param($Listener)
+        $client = $Listener.AcceptTcpClient()
+        $bytes = [Text.Encoding]::ASCII.GetBytes("INFO {`"server_id`":`"TEST`",`"version`":`"2.10.28`",`"proto`":1}`r`n")
+        $stream = $client.GetStream()
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+        Start-Sleep -Milliseconds 500
+        $client.Close()
+    }).AddArgument($listener)
+    $serverRun = $serverPs.BeginInvoke()
+    Check 'version read from a live INFO line' (Get-NatsInfoVersion -HostName '127.0.0.1' -Port $infoPort) '2.10.28'
+    [void]$serverPs.EndInvoke($serverRun)
+    $serverPs.Dispose()
+} finally {
+    $listener.Stop()
+}
+Check 'nothing listening gives no version' (Get-NatsInfoVersion -HostName '127.0.0.1' -Port $infoPort -TimeoutMs 1000) ''
+
+'--- NATS: client connections ---'
+& {
+    function Get-NetTCPConnection {
+        [CmdletBinding()] param($State, $LocalPort, $RemotePort)
+        $rows = @(if ($PSBoundParameters.ContainsKey('LocalPort')) { $script:FakeServerRows } else { $script:FakeClientRows })
+        if ($script:FakeTcpBroken) { throw 'WMI is broken' }
+        if ($rows.Count -eq 0) { Write-Error -Category ObjectNotFound -Message 'No matching MSFT_NetTCPConnection objects found' }
+        $rows
+    }
+    function Get-Process { [CmdletBinding()] param($Id) if ($script:FakeProcs.ContainsKey([int]$Id)) { [pscustomobject]@{ ProcessName = $script:FakeProcs[[int]$Id] } } }
+    function Row([string] $Address, [int] $ProcessId) { [pscustomobject]@{ RemoteAddress=$Address; OwningProcess=$ProcessId } }
+    $script:FakeProcs = @{ 100='nats-server'; 200='Veeam.Archiver.Service'; 300='Veeam.Archiver.Proxy'; 400='powershell' }
+    $script:FakeTcpBroken = $false
+    $script:FakeServerRows = @((Row '127.0.0.1' 100), (Row '::ffff:127.0.0.1' 100))
+    $script:FakeClientRows = @((Row '127.0.0.1' 200), (Row '127.0.0.1' 300), (Row '127.0.0.1' 400))
+    $s = Get-NatsClientSummary -Port 4222
+    Check 'local clients are not remote'     $s.RemoteAddresses.Count 0
+    Check 'VB365 processes found'            ($s.Vb365Processes -join ',') 'Veeam.Archiver.Proxy,Veeam.Archiver.Service'
+    $script:FakeServerRows = @((Row '127.0.0.1' 100), (Row '10.9.9.9' 100))
+    Check 'a client on another machine'      ((Get-NatsClientSummary -Port 4222).RemoteAddresses -join ',') '10.9.9.9'
+    $script:FakeServerRows = @(); $script:FakeClientRows = @()
+    $s = Get-NatsClientSummary -Port 4222
+    Check 'no connections is not an error'   "$($s.RemoteAddresses.Count)/$($s.Vb365Processes.Count)" '0/0'
+    $script:FakeTcpBroken = $true
+    Check 'an unreadable table is an error'  (Throws { Get-NatsClientSummary -Port 4222 }) 'True'
+}
+
+'--- NATS: package checks ---'
+$p = 'nats-server-v2.10.28-windows-amd64/'
+Check 'release layout accepted'      (Test-NatsZipEntryNames -Names @($p, "${p}nats-server.exe", "${p}README.md", "${p}LICENSE") -Version '2.10.28') ''
+Check 'extra file in the folder accepted' (Test-NatsZipEntryNames -Names @("${p}nats-server.exe", "${p}CHANGELOG.md") -Version '2.10.28') ''
+Check 'climbing entry refused'       ((Test-NatsZipEntryNames -Names @("${p}nats-server.exe", "${p}../evil.exe") -Version '2.10.28') -match 'unsafe') 'True'
+Check 'backslash entry refused'      ((Test-NatsZipEntryNames -Names @("${p}nats-server.exe", "nats-server-v2.10.28-windows-amd64\x") -Version '2.10.28') -match 'unsafe') 'True'
+Check 'rooted entry refused'         ((Test-NatsZipEntryNames -Names @("${p}nats-server.exe", '/etc/x') -Version '2.10.28') -match 'unsafe') 'True'
+Check 'entry outside the folder refused' ((Test-NatsZipEntryNames -Names @("${p}nats-server.exe", 'nats-server.exe') -Version '2.10.28') -match 'outside') 'True'
+Check 'another version refused'      ((Test-NatsZipEntryNames -Names @('nats-server-v2.10.29-windows-amd64/nats-server.exe') -Version '2.10.28') -ne '') 'True'
+Check 'missing program refused'      ((Test-NatsZipEntryNames -Names @("${p}README.md") -Version '2.10.28') -match 'exactly one') 'True'
+Check 'empty package refused'        ((Test-NatsZipEntryNames -Names @() -Version '2.10.28') -match 'empty') 'True'
+$zipTemp = Join-Path $env:TEMP "vpgu-nats-zip-$PID"
+New-Item -ItemType Directory -Path $zipTemp -Force | Out-Null
+try {
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    function New-TestZip([string] $Path, [string[]] $Entries) {
+        $zip = [IO.Compression.ZipFile]::Open($Path, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($name in $Entries) {
+                $entry = $zip.CreateEntry($name)
+                if (-not $name.EndsWith('/')) { $w = New-Object IO.StreamWriter($entry.Open()); $w.Write("content of $name"); $w.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    }
+    $good = Join-Path $zipTemp 'good.zip'
+    New-TestZip $good @($p, "${p}nats-server.exe", "${p}README.md", "${p}LICENSE")
+    $exe = Expand-NatsPackage -ZipPath $good -Version '2.10.28' -Destination (Join-Path $zipTemp 'stage1')
+    Check 'program extracted'            ([IO.File]::ReadAllText($exe)) "content of ${p}nats-server.exe"
+    Check 'only the program is extracted' (@(Get-ChildItem -LiteralPath (Join-Path $zipTemp 'stage1')).Count) 1
+    $bad = Join-Path $zipTemp 'bad.zip'
+    New-TestZip $bad @("${p}nats-server.exe", "${p}../../evil.txt")
+    Check 'climbing package refused'     (Throws { Expand-NatsPackage -ZipPath $bad -Version '2.10.28' -Destination (Join-Path $zipTemp 'stage2') }) 'True'
+    Check 'refused package writes nothing' (Test-Path (Join-Path $zipTemp 'stage2')) 'False'
+    Check 'nothing escaped the folder'   (Test-Path (Join-Path (Split-Path $zipTemp) 'evil.txt')) 'False'
+    Check 'an existing stage folder is refused' (Throws { Expand-NatsPackage -ZipPath $good -Version '2.10.28' -Destination (Join-Path $zipTemp 'stage1') }) 'True'
+    $abc = Join-Path $zipTemp 'abc.txt'
+    [IO.File]::WriteAllText($abc, 'abc')
+    Check 'SHA256 is lower-case hex'     (Get-FileSha256 $abc) 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+} finally {
+    Remove-Item -LiteralPath $zipTemp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+'--- NATS: store path safety ---'
+$wr = 'C:\ProgramData\VeeamPgUpdate'
+Check 'the VB365 store is safe'      (Test-NatsStorePathSafe -StoreDir 'C:\ProgramData\Veeam\Backup365\nats' -WorkRoot $wr) 'True'
+Check 'a drive root is not'          (Test-NatsStorePathSafe -StoreDir 'C:\' -WorkRoot $wr) 'False'
+Check 'one folder deep is not'       (Test-NatsStorePathSafe -StoreDir 'C:\nats' -WorkRoot $wr) 'False'
+Check 'ProgramData itself is not'    (Test-NatsStorePathSafe -StoreDir $env:ProgramData -WorkRoot $wr) 'False'
+Check 'Program Files itself is not'  (Test-NatsStorePathSafe -StoreDir $env:ProgramFiles -WorkRoot $wr) 'False'
+Check 'inside WorkRoot is not'       (Test-NatsStorePathSafe -StoreDir 'C:\ProgramData\VeeamPgUpdate\nats' -WorkRoot $wr) 'False'
+Check 'holding WorkRoot is not'      (Test-NatsStorePathSafe -StoreDir 'C:\Data\stuff' -WorkRoot 'C:\Data\stuff\work') 'False'
+Check 'a relative path is not'       (Test-NatsStorePathSafe -StoreDir 'nats\store' -WorkRoot $wr) 'False'
+Check 'the NATS program folder is not' (Test-NatsStorePathSafe -StoreDir 'C:\Program Files\NATS\store' -WorkRoot $wr -NatsRoot 'C:\Program Files\NATS') 'False'
+
+'--- NATS: discovery is read-only and refuses what it cannot prove ---'
+& {
+    # Long path names: production normalises paths, and %TEMP% can be an 8.3 short name.
+    $base = Join-Path $env:TEMP "vpgu-nats-discovery-$PID"
+    New-Item -ItemType Directory -Path $base -Force | Out-Null
+    $base = [IO.Path]::GetFullPath($base)
+    $natsRootD = Join-Path $base 'Program Files\NATS'
+    $oldDir = Join-Path $natsRootD 'nats-server-v2.10.22-windows-amd64'
+    $plainDir = Join-Path $natsRootD 'nats'
+    $confDir = Join-Path $base 'ProgramData\NATS'
+    $storeD = Join-Path $base 'ProgramData\Veeam\Backup365\nats'
+    $workD = Join-Path $base 'VeeamPgUpdate'
+    foreach ($d in @($oldDir, $plainDir, $confDir, (Join-Path $storeD 'jetstream'), $workD)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    Set-Content -LiteralPath (Join-Path $oldDir 'nats-server.exe') -Value 'old program'
+    Set-Content -LiteralPath (Join-Path $plainDir 'nats-server.exe') -Value 'plain program'
+    Set-Content -LiteralPath (Join-Path $storeD 'jetstream\meta.inf') -Value 'store'
+    $confD = Join-Path $confDir 'nats-server.conf'
+    function Write-TestConf([string] $Store = $storeD, [string] $Extra = '') {
+        $escaped = $Store -replace '\\', '\\'
+        Set-Content -LiteralPath $confD -Value "port: 4222`njetstream {`n  store_dir: `"$escaped`"`n}`nauthorization { user: admin, password: `"`$2a`$11`$bcryptvalue`" }`n$Extra"
+    }
+    try {
+        function Get-CimInstance { [CmdletBinding()] param($ClassName, $Filter) $script:FakeNatsService }
+        function Invoke-Native { param([string] $FilePath, [string[]] $Arguments) $script:NativeCalls += "$FilePath $($Arguments -join ' ')"; [pscustomobject]@{ ExitCode=0; StdOut="nats-server: v$($script:FakeExeVersion)"; StdErr='' } }
+        function Get-NatsInfoVersion { param($HostName, $Port, $TimeoutMs) $script:InfoAsked = "${HostName}:$Port"; $script:FakeInfo }
+        function Get-NatsClientSummary { param($Port) [pscustomobject]@{ RemoteAddresses=@($script:FakeRemote); Vb365Processes=@('Veeam.Archiver.Service') } }
+        $cfgXml = [xml]'<Config><Server JetStreamConnectionString="nats://admin:SecretPw==@localhost:4222?passwordEncrypted" JetStreamReplicaCount="3"/></Config>'
+        $proxyXmlD = [xml]'<Proxy><Proxy JetStreamConnectionString="nats://admin:SecretPw==@localhost:4222?passwordEncrypted"/></Proxy>'
+        function Find-TestNats {
+            param([string] $Exe = (Join-Path $oldDir 'nats-server.exe'), [string] $Version = '2.10.22', [string] $Info = '', [string] $State = 'Running',
+                  $Remote = @(), [string] $Vb365 = '13.6.0.0', [bool] $Updates = $true, $Cfg = $cfgXml, $Proxy = $proxyXmlD, [string] $WorkRootD = $workD)
+            $script:FakeExeVersion = $Version
+            $script:FakeInfo = if ($Info) { $Info } else { $Version }
+            $script:FakeRemote = @($Remote)
+            $script:NativeCalls = @()
+            $script:FakeNatsService = [pscustomobject]@{ Name='nats-server'; PathName="`"$Exe`" -c `"$confD`""; State=$State; StartMode='Auto'; StartName='LocalSystem' }
+            Get-NatsDiscovery -Vb365Version $Vb365 -ConfigXml $Cfg -ProxyXml $Proxy -WorkRoot $WorkRootD -UpdatesEnabled $Updates -NatsRoot $natsRootD
+        }
+        Write-TestConf
+        $d = Find-TestNats
+        Check 'due update found'                 "$($d.Status) $($d.Installed) $($d.Target)" 'UPDATE_AVAILABLE 2.10.22 2.10.28'
+        Check 'plan: old command line exact'     $d.Plan.OldImagePath "`"$(Join-Path $oldDir 'nats-server.exe')`" -c `"$confD`""
+        Check 'plan: new folder beside the old'  $d.Plan.NewDir (Join-Path $natsRootD 'nats-server-v2.10.28-windows-amd64')
+        Check 'plan: new command line keeps the arguments' $d.Plan.NewImagePath "`"$(Join-Path $natsRootD 'nats-server-v2.10.28-windows-amd64\nats-server.exe')`" -c `"$confD`""
+        Check 'plan: store from the config file' $d.Plan.StoreDir $storeD
+        Check 'plan: port'                       $d.Plan.Port 4222
+        Check 'plan: pinned hash'                $d.Plan.TargetSha256 '98b8571231b00ebe0445cc7f317f6425c1fbc2edecd455949d37022e04281657'
+        Check 'plan: VB365 was connected'        $d.Plan.BaselineVb365Connected 'True'
+        Check 'version asked where NATS listens' $script:InfoAsked '127.0.0.1:4222'
+        Check 'only --version is run'            ($script:NativeCalls -join ';') "$(Join-Path $oldDir 'nats-server.exe') --version"
+        Check 'no credential in Detail'          ($d.Detail -match 'SecretPw|bcryptvalue') 'False'
+        $d = Find-TestNats -Version '2.10.28' -Exe (Join-Path $plainDir 'nats-server.exe')
+        Check 'current: nothing to do'           "$($d.Status) $($null -eq $d.Plan)" 'CURRENT True'
+        $d = Find-TestNats -Version '2.12.6' -Exe (Join-Path $plainDir 'nats-server.exe')
+        Check 'unlisted 2.12.6 -> 2.12.8'        "$($d.Status) $($d.Target)" 'UPDATE_AVAILABLE 2.12.8'
+        $d = Find-TestNats -Version '2.10.18'
+        Check 'folder and program disagree'      $d.Status 'UNRECOGNISED_LAYOUT'
+        $d = Find-TestNats -State 'Stopped'
+        Check 'stopped NATS is left alone'       "$($d.Status) $($d.Installed)" 'NOT_RUNNING 2.10.22'
+        $script:FakeNatsService = $null
+        $d = Get-NatsDiscovery -Vb365Version '13.6.0.0' -ConfigXml $cfgXml -ProxyXml $proxyXmlD -WorkRoot $workD -NatsRoot $natsRootD
+        Check 'no nats-server service'           $d.Status 'NOT_LOCAL'
+        $d = Find-TestNats -Vb365 '13.7.0.0'
+        Check 'VB365 without a list'             "$($d.Status) $($d.Installed)" 'POLICY_UNKNOWN_VB365 2.10.22'
+        $d = Find-TestNats -Updates $false
+        Check 'updateNats false only reports'    "$($d.Status) $($d.Target) $($null -eq $d.Plan)" 'UPDATES_OFF 2.10.28 True'
+        $d = Find-TestNats -Remote @('10.9.9.9')
+        Check 'other machines connected'         "$($d.Status) $($null -eq $d.Plan)" 'REMOTE_CLIENTS True'
+        $d = Find-TestNats -Info '2.10.18'
+        Check 'NATS answers another version'     ($d.Status -eq 'UNRECOGNISED_LAYOUT' -and $d.Detail -match 'answered version 2\.10\.18') 'True'
+        $d = Find-TestNats -Cfg ([xml]'<Config><Server JetStreamConnectionString="nats://admin:SecretPw==@nats-elsewhere.example:4222"/></Config>')
+        Check 'NATS on another server'           ($d.Status -eq 'UNRECOGNISED_LAYOUT' -and $d.Detail -match 'not this server') 'True'
+        Check 'connection password never shown'  ($d.Detail -match 'SecretPw') 'False'
+        $d = Find-TestNats -Cfg ([xml]'<Config><Server JetStreamConnectionString="nats://admin:x@localhost:4333"/></Config>')
+        Check 'port disagreement refused'        ($d.Detail -match 'port 4333') 'True'
+        $d = Find-TestNats -Cfg ([xml]'<Config><Server/></Config>') -Proxy ([xml]'<Proxy/>')
+        Check 'no connection string refused'     ($d.Detail -match 'no JetStreamConnectionString') 'True'
+        Write-TestConf -Extra 'cluster { name: c1 }'
+        $d = Find-TestNats
+        Check 'clustered NATS refused'           ($d.Status -eq 'UNRECOGNISED_LAYOUT' -and $d.Detail -match 'uses cluster') 'True'
+        Write-TestConf -Extra "other { store_dir: 'C:\elsewhere\nats' }"
+        $d = Find-TestNats
+        Check 'two stores refused'               ($d.Detail -match '2 store_dir') 'True'
+        Write-TestConf -Store (Join-Path $base 'missing\store')
+        $d = Find-TestNats
+        Check 'missing store refused'            ($d.Detail -match 'missing') 'True'
+        Write-TestConf
+        $d = Find-TestNats -WorkRootD $storeD
+        Check 'store overlapping WorkRoot refused' ($d.Detail -match 'overlaps') 'True'
+        Check 'refusals carry no plan'           ($null -eq $d.Plan) 'True'
+    } finally {
+        Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+'--- NATS: the service is switched through the service manager ---'
+& {
+    function Get-CimInstance { [CmdletBinding()] param($ClassName, $Filter) [pscustomobject]@{ Name='nats-server'; PathName=$script:CimPath } }
+    function Invoke-CimMethod {
+        [CmdletBinding()] param($InputObject, $MethodName, $Arguments)
+        $script:CimCalls += "$MethodName"
+        if ($script:CimReturn -eq 0 -and -not $script:CimIgnore) { $script:CimPath = $Arguments['PathName'] }
+        [pscustomobject]@{ ReturnValue=$script:CimReturn }
+    }
+    $script:CimCalls = @(); $script:CimPath = 'old'; $script:CimReturn = 0; $script:CimIgnore = $false
+    Check 'a service manager change is accepted' (Throws { Set-NatsServicePath -PathName '"C:\new\nats-server.exe" -c "C:\c.conf"' }) 'False'
+    Check 'it calls Win32_Service.Change'    ($script:CimCalls -join ',') 'Change'
+    Check 'the new command line is in place' $script:CimPath '"C:\new\nats-server.exe" -c "C:\c.conf"'
+    $script:CimReturn = 2
+    Check 'a refused change throws'          (Throws { Set-NatsServicePath -PathName 'x' }) 'True'
+    $script:CimReturn = 0; $script:CimIgnore = $true
+    Check 'a change that reads back wrong throws' (Throws { Set-NatsServicePath -PathName 'y' }) 'True'
+
+    function Get-Service { [CmdletBinding()] param([Parameter(Position=0)][string] $Name) if ($script:SvcState.ContainsKey($Name)) { [pscustomobject]@{ Name=$Name; Status=$script:SvcState[$Name] } } }
+    function Stop-Service { [CmdletBinding()] param([Parameter(Position=0)][string] $Name) $script:Stops += $Name; if (-not $script:StuckStop) { $script:SvcState[$Name] = 'Stopped' } }
+    function Start-Sleep { [CmdletBinding()] param([int] $Seconds) }
+    $script:SvcState = @{ 'nats-server'='Running' }; $script:Stops = @(); $script:StuckStop = $false
+    Stop-ServiceAndWait -Name 'nats-server' -Seconds 5
+    Check 'a service is stopped and waited for' "$($script:Stops -join ',') $($script:SvcState['nats-server'])" 'nats-server Stopped'
+    Stop-ServiceAndWait -Name 'nats-server' -Seconds 5
+    Check 'a stopped service is left alone'  ($script:Stops -join ',') 'nats-server'
+    Stop-ServiceAndWait -Name 'not-installed' -Seconds 5
+    Check 'a missing service is no error'    ($script:Stops -join ',') 'nats-server'
+    $script:SvcState = @{ 'nats-server'='Running' }; $script:StuckStop = $true
+    Check 'a service that will not stop throws' (Throws { Stop-ServiceAndWait -Name 'nats-server' -Seconds 0 }) 'True'
+}
+& {
+    function Get-Service { [CmdletBinding()] param([Parameter(Position=0)][string] $Name) if ($script:SvcState.ContainsKey($Name)) { [pscustomobject]@{ Name=$Name; Status=$script:SvcState[$Name] } } }
+    function Stop-Service {
+        [CmdletBinding()] param([Parameter(Position=0)][string] $Name)
+        $script:Stops += $Name
+        if ($Name -eq 'Veeam.Archiver.Service' -and $script:SvcState['Veeam.Archiver.REST.Service'] -eq 'Running') { throw 'Cannot stop service because it has dependent services' }
+        $script:SvcState[$Name] = 'Stopped'
+    }
+    function Start-Sleep { [CmdletBinding()] param([int] $Seconds) }
+    $script:SvcState = @{ 'Veeam.Archiver.Proxy'='Running'; 'Veeam.Archiver.Service'='Running'; 'Veeam.Archiver.REST.Service'='Running' }
+    $script:Stops = @()
+    Stop-ServicesInOrder -Names @('Veeam.Archiver.Proxy','Veeam.Archiver.Service','Veeam.Archiver.REST.Service') -Seconds 30
+    Check 'a service with a dependent stops on a later pass' (@($script:SvcState.Values | Where-Object { $_ -ne 'Stopped' }).Count) 0
+    Check 'it is tried again after its dependent'  ($script:Stops -join ',') 'Veeam.Archiver.Proxy,Veeam.Archiver.Service,Veeam.Archiver.REST.Service,Veeam.Archiver.Service'
+    $script:SvcState = @{ 'Veeam.Archiver.Service'='StopPending' }
+    Check 'a stuck service fails after the wait'   (Throws { Stop-ServicesInOrder -Names @('Veeam.Archiver.Service') -Seconds 0 }) 'True'
+}
+$priorRecoveryState = Get-Variable -Name RecoveryState -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+$script:RecoveryState = $null
+Check 'no run is no NATS run'                  (Get-NatsRunFacts).IsNatsRun 'False'
+$script:RecoveryState = [pscustomobject]@{ Stage='SERVICES_STOPPED' }
+Check 'a PostgreSQL run is no NATS run'        (Get-NatsRunFacts).IsNatsRun 'False'
+$script:RecoveryState = [pscustomobject]@{ Change='NATS' }
+$nf = Get-NatsRunFacts
+Check 'a NATS run without a plan is read safely' "$($nf.IsNatsRun)|$($nf.Stage)|$($nf.OldVersion)" 'True||'
+$script:RecoveryState = [pscustomobject]@{ Change='NATS'; NatsStage='REVERTED'; NatsPlan=[pscustomobject]@{ OldVersion='2.10.22'; TargetVersion='2.10.28' } }
+$nf = Get-NatsRunFacts
+Check 'a NATS run is read in full'             "$($nf.Stage) $($nf.OldVersion) $($nf.TargetVersion)" 'REVERTED 2.10.22 2.10.28'
+$script:RecoveryState = $priorRecoveryState
+Check 'manual rollback text names the way back' ((Get-NatsManualRevertAction -Plan ([pscustomobject]@{ OldVersion='2.10.22'; OldExe='C:\o\nats-server.exe'; RegBackup='C:\r.reg'; StoreBackup='C:\s' })) -match '2\.10\.22.*C:\\o\\nats-server\.exe.*C:\\r\.reg.*C:\\s.*run -Recover') 'True'
+
+'--- NATS: store restore mirrors the copy back ---'
+$storeTest = Join-Path $env:TEMP "vpgu-nats-store-$PID"
+try {
+    $copyDir = Join-Path $storeTest 'work\runs\r\backup\nats\store'
+    $liveDir = Join-Path $storeTest 'data\nats'
+    New-Item -ItemType Directory -Path (Join-Path $copyDir 'jetstream') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $liveDir 'jetstream') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $copyDir 'jetstream\a.dat'), 'aaaa')
+    [IO.File]::WriteAllText((Join-Path $copyDir 'jetstream\b.dat'), 'bb')
+    [IO.File]::WriteAllText((Join-Path $liveDir 'jetstream\a.dat'), 'changed by the new version')
+    [IO.File]::WriteAllText((Join-Path $liveDir 'jetstream\new.idx'), 'written by the new version')
+    $storePlan = [pscustomobject]@{ StoreDir=$liveDir; StoreBackup=$copyDir; StoreFiles=2; StoreBytes=6 }
+    Restore-NatsStore -Plan $storePlan -WorkRoot (Join-Path $storeTest 'work')
+    Check 'a changed store file is put back'  ([IO.File]::ReadAllText((Join-Path $liveDir 'jetstream\a.dat'))) 'aaaa'
+    Check 'a missing store file is put back'  (Test-Path (Join-Path $liveDir 'jetstream\b.dat')) 'True'
+    Check 'a file the new version wrote goes' (Test-Path (Join-Path $liveDir 'jetstream\new.idx')) 'False'
+    $storePlan.StoreFiles = 3
+    Check 'a count mismatch is an error'      (Throws { Restore-NatsStore -Plan $storePlan -WorkRoot (Join-Path $storeTest 'work') }) 'True'
+    $unsafe = [pscustomobject]@{ StoreDir='C:\'; StoreBackup=$copyDir; StoreFiles=2; StoreBytes=6 }
+    Check 'a drive root is never mirrored into' (Throws { Restore-NatsStore -Plan $unsafe -WorkRoot (Join-Path $storeTest 'work') }) 'True'
+    $missingCopy = [pscustomobject]@{ StoreDir=$liveDir; StoreBackup=(Join-Path $storeTest 'nope'); StoreFiles=2; StoreBytes=6 }
+    Check 'a missing copy is an error'        (Throws { Restore-NatsStore -Plan $missingCopy -WorkRoot (Join-Path $storeTest 'work') }) 'True'
+    Check 'a missing copy deletes nothing'    (Test-Path (Join-Path $liveDir 'jetstream\a.dat')) 'True'
+} finally {
+    Remove-Item -LiteralPath $storeTest -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+'--- NATS: rollback puts the old program back ---'
+& {
+    $base = Join-Path $env:TEMP "vpgu-nats-revert-$PID"
+    $natsRootR = Join-Path $base 'NATS'
+    $oldDirR = Join-Path $natsRootR 'nats-server-v2.10.22-windows-amd64'
+    $newDirR = Join-Path $natsRootR 'nats-server-v2.10.28-windows-amd64'
+    New-Item -ItemType Directory -Path $oldDirR -Force | Out-Null
+    $oldExeR = Join-Path $oldDirR 'nats-server.exe'
+    Set-Content -LiteralPath $oldExeR -Value 'old program'
+    $script:RunDir = Join-Path $base 'work\runs\20261013-010203-004-1'
+    New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
+    $oldImage = "`"$oldExeR`" -c `"C:\ProgramData\NATS\nats-server.conf`""
+    $newImage = "`"$(Join-Path $newDirR 'nats-server.exe')`" -c `"C:\ProgramData\NATS\nats-server.conf`""
+    try {
+        function Save-RecoveryState { param([string] $Stage, $InstallerStarted) $script:Saves += "$($script:RecoveryState.NatsStage)" }
+        function Get-Service {
+            [CmdletBinding()] param([Parameter(Position=0)][string[]] $Name)
+            foreach ($n in @($Name)) { foreach ($k in @($script:Svc.Keys | Where-Object { $_ -like $n } | Sort-Object)) { [pscustomobject]@{ Name=$k; Status=$script:Svc[$k] } } }
+        }
+        function Stop-Service { [CmdletBinding()] param([Parameter(Position=0)][string] $Name) $script:Actions += "STOP:$Name"; $script:Svc[$Name] = 'Stopped' }
+        function Start-Sleep { [CmdletBinding()] param([int] $Seconds) }
+        function Get-CimInstance { [CmdletBinding()] param($ClassName, $Filter) [pscustomobject]@{ Name='nats-server'; PathName=$script:FakePath; State=$script:FakeCimState } }
+        function Set-NatsServicePath { param([string] $PathName) $script:Actions += 'PATH'; $script:FakePath = $PathName }
+        function Restore-NatsStore { param($Plan, $WorkRoot) $script:Actions += 'STORE' }
+        function Invoke-Native { param([string] $FilePath, [string[]] $Arguments) [pscustomobject]@{ ExitCode=0; StdOut="nats-server: v$($script:FakeOldReports)"; StdErr='' } }
+        function Invoke-TestRevert {
+            param([string] $NatsStage, [bool] $Started = $false, [string] $Mode = '', [hashtable] $Services = $null,
+                  [string] $OldReports = '2.10.22', [bool] $NewDirMade = $true, [string[]] $NewDirFiles = @('nats-server.exe'), [string] $CimState = 'Stopped', [string] $StagedHash = '')
+            $script:Svc = if ($Services) { @{} + $Services } else { @{ 'Veeam.Archiver.Proxy'='Stopped'; 'Veeam.Archiver.Service'='Stopped'; 'nats-server'='Running' } }
+            $script:Actions = @(); $script:Saves = @(); $script:FakePath = $newImage; $script:FakeOldReports = $OldReports; $script:FakeCimState = $CimState
+            Remove-Item -LiteralPath $newDirR -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $newDirR -Force | Out-Null
+            foreach ($file in $NewDirFiles) { Set-Content -LiteralPath (Join-Path $newDirR $file) -Value 'new program' }
+            $script:RecoveryState = [pscustomobject]@{
+                Change='NATS'; InstallerStarted=$false; NatsStage=$NatsStage; NatsRevertMode=$Mode; NatsNewBinaryStarted=$Started
+                NatsPlan=[pscustomobject]@{
+                    OldVersion='2.10.22'; TargetVersion='2.10.28'; OldImagePath=$oldImage; NewImagePath=$newImage; OldExe=$oldExeR; OldFolder=$oldDirR
+                    NewDir=$newDirR; NewExe=(Join-Path $newDirR 'nats-server.exe'); NewDirCreated=$NewDirMade
+                    OldExeSha256=(Get-FileSha256 $oldExeR); StagedExeSha256=$(if ($StagedHash) { $StagedHash } elseif (Test-Path (Join-Path $newDirR 'nats-server.exe')) { Get-FileSha256 (Join-Path $newDirR 'nats-server.exe') } else { 'none' })
+                    StoreDir='C:\x\y'; StoreBackup='C:\b'; StoreFiles=1; StoreBytes=1; RegBackup='C:\r.reg'
+                }
+            }
+            return (Restore-NatsInstallation -WorkRootPath (Join-Path $base 'work'))
+        }
+        $r = Invoke-TestRevert -NatsStage 'SWAPPED'
+        Check 'switched: reverted'                     $r ''
+        Check 'switched: back on the old command line' $script:FakePath $oldImage
+        Check 'switched: NATS stopped first'           $script:Actions[0] 'STOP:nats-server'
+        Check 'switched: store kept (new never ran)'   ($script:Actions -contains 'STORE') 'False'
+        Check 'switched: new folder removed'           (Test-Path $newDirR) 'False'
+        Check 'switched: old program kept'             (Test-Path $oldExeR) 'True'
+        Check 'switched: stage REVERTED'               $script:RecoveryState.NatsStage 'REVERTED'
+        Check 'switched: REVERTING saved first'        ($script:Saves -join ',') 'REVERTING,REVERTED'
+        Check 'switched: full mode recorded'           $script:RecoveryState.NatsRevertMode 'Full'
+        $r = Invoke-TestRevert -NatsStage 'SWAPPED' -CimState 'Running'
+        Check 'started on the new program at boot: store put back' ($script:Actions -contains 'STORE') 'True'
+        $r = Invoke-TestRevert -NatsStage 'NATS_VERIFIED' -Started $true
+        Check 'started alone: store put back'          ($script:Actions -contains 'STORE') 'True'
+        Check 'started alone: command line before store' ([array]::IndexOf($script:Actions, 'PATH') -lt [array]::IndexOf($script:Actions, 'STORE')) 'True'
+        $running = @{ 'Veeam.Archiver.Proxy'='Running'; 'Veeam.Archiver.Service'='Running'; 'Veeam.Archiver.REST.Service'='Running'; 'nats-server'='Running' }
+        $r = Invoke-TestRevert -NatsStage 'VEEAM_STARTED' -Started $true -Services $running
+        Check 'VB365 used it: reverted'                $r ''
+        Check 'VB365 used it: Proxy stopped first'     $script:Actions[0] 'STOP:Veeam.Archiver.Proxy'
+        Check 'VB365 used it: then the Service'        $script:Actions[1] 'STOP:Veeam.Archiver.Service'
+        Check 'VB365 used it: NATS stopped after VB365' ([array]::IndexOf($script:Actions, 'STOP:nats-server') -gt [array]::IndexOf($script:Actions, 'STOP:Veeam.Archiver.REST.Service')) 'True'
+        Check 'VB365 used it: store kept'              ($script:Actions -contains 'STORE') 'False'
+        Check 'VB365 used it: program-only mode'       $script:RecoveryState.NatsRevertMode 'Binary'
+        $r = Invoke-TestRevert -NatsStage 'REVERTING' -Mode 'Binary' -Started $true
+        Check 'an interrupted program-only revert stays so' "$($script:RecoveryState.NatsRevertMode) $($script:Actions -contains 'STORE')" 'Binary False'
+        foreach ($quiet in @('PLANNED','BACKING_UP','BACKED_UP','COMMITTED','REVERTED')) {
+            $r = Invoke-TestRevert -NatsStage $quiet
+            Check "${quiet}: nothing to undo"            "[$r] $($script:Actions.Count) $($script:FakePath -eq $newImage)" '[] 0 True'
+        }
+        $r = Invoke-TestRevert -NatsStage 'SWAPPED' -Services @{ 'Veeam.Archiver.Service'='Running'; 'nats-server'='Running' }
+        Check 'Veeam running: no full revert'          ($r -match 'not stopped') 'True'
+        Check 'Veeam running: command line untouched'  $script:FakePath $newImage
+        $r = Invoke-TestRevert -NatsStage 'SWAPPED' -OldReports '2.10.18'
+        Check 'old program wrong: reported'            ($r -match "reports '2\.10\.18'") 'True'
+        Check 'old program wrong: not marked REVERTED' $script:RecoveryState.NatsStage 'REVERTING'
+        $r = Invoke-TestRevert -NatsStage 'SWAPPED' -NewDirFiles @('nats-server.exe', 'notes.txt')
+        Check 'foreign file: folder kept'              (Test-Path (Join-Path $newDirR 'notes.txt')) 'True'
+        Check 'foreign file: still reverted'           $r ''
+        $r = Invoke-TestRevert -NatsStage 'SWAPPED' -NewDirMade $false
+        Check 'folder this run did not make: kept'     (Test-Path $newDirR) 'True'
+        $r = Invoke-TestRevert -NatsStage 'SWAP_STARTED' -StagedHash ('0' * 64)
+        Check 'a half-copied program this run made: removed' (Test-Path $newDirR) 'False'
+        $r = Invoke-TestRevert -NatsStage 'SWAP_STARTED' -NewDirFiles @()
+        Check 'an empty folder this run made: removed' (Test-Path $newDirR) 'False'
+        $script:RecoveryState = [pscustomobject]@{ Stage='SERVICES_STOPPED'; NatsStage='SWAPPED' }
+        Check 'a PostgreSQL run has no NATS to undo'   (Restore-NatsInstallation -WorkRootPath $base) ''
+    } finally {
+        $script:RecoveryState = $null
+        Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+'--- NATS: -Recover finishes or reverts an interrupted NATS run ---'
+& {
+    $WorkRoot = Join-Path $env:TEMP "vpgu-recover-nats-$PID"
+    $runId = '20261013-010203-004-2222'
+    $runPath = [IO.Path]::GetFullPath((Join-Path $WorkRoot "runs\$runId")).TrimEnd('\')
+    New-Item -ItemType Directory -Path $WorkRoot -Force | Out-Null
+    Protect-Folder $WorkRoot | Out-Null
+    New-Item -ItemType Directory -Path $runPath -Force | Out-Null
+    try {
+        $statePath = Join-Path $runPath 'recovery-state.json'
+        $markerPath = Join-Path $WorkRoot 'CHANGES-IN-PROGRESS.marker'
+        $psqlFake = Join-Path $runPath 'psql.exe'
+        Set-Content -LiteralPath $psqlFake -Value 'fake'
+        Write-AtomicJson -Path (Join-Path $runPath 'disabled-jobs.json') -Depth 5 -InputObject @(
+            [pscustomobject][ordered]@{ Family='VB365';     Id='j1'; Name='Example Backup Job'; WasEnabled=$true; Restored=$false },
+            [pscustomobject][ordered]@{ Family='VB365Copy'; Id='j2'; Name='Example Copy Job';   WasEnabled=$true; Restored=$false })
+        Write-AtomicJson -Path (Join-Path $runPath 'veeam-service-state.json') -Depth 4 -InputObject @(
+            [pscustomobject][ordered]@{ Name='Veeam.Archiver.Service'; DisplayName='Example VB365 Service'; Status='Running'; WasRunning=$true; StartupType='Automatic'; DependsOn=@() },
+            [pscustomobject][ordered]@{ Name='Veeam.Archiver.Proxy';   DisplayName='Example VB365 Proxy';   Status='Running'; WasRunning=$true; StartupType='Automatic'; DependsOn=@() })
+        Write-AtomicJson -Path (Join-Path $runPath 'pg-service-state.json') -InputObject ([pscustomobject][ordered]@{
+            Name='postgresql-x64-15'; WasRunning=$true; StartupType='Automatic'; PsqlPath=$psqlFake; Port='5432' })
+        Write-AtomicJson -Path (Join-Path $runPath 'nats-service-state.json') -InputObject ([pscustomobject][ordered]@{
+            Name='nats-server'; Status='Running'; WasRunning=$true; StartupType='Automatic'; PathName='"C:\old\nats-server.exe" -c "C:\c.conf"' })
+
+        $EXIT = @{ OK=0; ESCALATE=40; ESCALATE_NOW=50 }
+        $script:Report = [ordered]@{ RecoveryRunDir=''; VeeamProducts=''; PgInstalled=''; PgTarget=''; JobsLeftDisabled=''; IssueCode=''; ActionRequired=''; NatsInstalled=''; NatsTarget=''; NatsStatus='' }
+        function Test-TrustedOwner { param($Path) return $true }
+        function Get-Service {
+            [CmdletBinding()] param([Parameter(Position=0)][string[]] $Name)
+            foreach ($n in @($Name)) { foreach ($k in @($script:Svc.Keys | Where-Object { $_ -like $n } | Sort-Object)) { [pscustomobject]@{ Name=$k; Status=$script:Svc[$k] } } }
+        }
+        function Stop-Service  { [CmdletBinding()] param([Parameter(Position=0)][string] $Name) $script:Actions += "STOP:$Name";  $script:Svc[$Name] = 'Stopped' }
+        function Start-Service { [CmdletBinding()] param([Parameter(Position=0)][string] $Name) $script:Actions += "START:$Name"; $script:Svc[$Name] = 'Running' }
+        function Set-ServiceStartupTypeExact { [CmdletBinding()] param([string] $Name, [string] $StartupType) }
+        function Get-ServiceStartupTypeExact { [CmdletBinding()] param([string] $Name) 'Automatic' }
+        function Get-Process { [CmdletBinding()] param([string] $Name) @() }
+        function Start-Sleep { [CmdletBinding()] param([int] $Seconds) }
+        function Invoke-Native {
+            param([string] $FilePath, [string[]] $Arguments)
+            if ($Arguments -contains '-f') { $script:Actions += 'TUNING' }
+            [pscustomobject]@{ ExitCode=0; StdOut='150019'; StdErr='' }
+        }
+        function Restore-VeeamServiceState { param([switch] $AllowStops) $script:Actions += 'RESTORE'; @() }
+        function Connect-VeeamModules { param([switch] $Vbr, [switch] $Vb365, [switch] $Quiet, [switch] $Reconnect) @() }
+        function Get-VeeamManagedJobInventory { param([bool] $Vbr, [bool] $Vb365) @() }
+        function Wait-VeeamIdle { param([bool] $Vbr, [bool] $Vb365, [int] $TimeoutMinutes, [string] $Context, [switch] $CloseConsoles) [pscustomobject]@{ Idle=$true; Labels=@() } }
+        function Enable-VeeamJobById { param($Record) $script:Actions += "ENABLE:$($Record.Name)" }
+        function Save-DisabledJobState { }
+        function Save-RecoveryState { param([string] $Stage, $InstallerStarted) $script:Actions += "SAVE:${Stage}:$($script:RecoveryState.NatsStage)" }
+        function Remove-RecoveryMarker { $script:Actions += 'MARKER-REMOVED'; $true }
+        function Test-NatsRunningAt { param($Plan, $Version, $ImagePath) $script:Actions += 'NATS-HEALTH'; $script:FakeNatsHealthy }
+        function Restore-NatsInstallation {
+            param([string] $WorkRootPath)
+            $script:Actions += 'NATS-REVERT'
+            if ($script:FakeRevertProblem) { return $script:FakeRevertProblem }
+            Set-RecoveryProperty NatsStage 'REVERTED'
+            return ''
+        }
+        function Complete-Run {
+            param([int] $Code, [string] $Outcome, [string] $Detail)
+            $script:RecoveryCapture = [pscustomobject]@{ Code=$Code; Outcome=$Outcome; Detail=$Detail }
+            throw 'COMPLETE-RUN-TEST-SENTINEL'
+        }
+        $stoppedAll = @{ 'postgresql-x64-15'='Running'; 'Veeam.Archiver.Service'='Stopped'; 'Veeam.Archiver.Proxy'='Stopped'; 'nats-server'='Stopped' }
+        $runningAll = @{ 'postgresql-x64-15'='Running'; 'Veeam.Archiver.Service'='Running'; 'Veeam.Archiver.Proxy'='Running'; 'nats-server'='Running' }
+        function Invoke-TestNatsRecover {
+            param([string] $Stage = 'SERVICES_STOPPED', [string] $NatsStage = 'SWAPPED', [int] $Schema = 2, [int] $MarkerSchema = 2,
+                  [string] $Change = 'NATS', [bool] $Healthy = $false, [string] $RevertProblem = '', [string] $Mode = '', [hashtable] $Services = $stoppedAll)
+            $script:Svc = @{} + $Services
+            $script:FakeNatsHealthy = $Healthy; $script:FakeRevertProblem = $RevertProblem
+            $script:Actions = @(); $script:RecoveryCapture = $null
+            $script:Report.IssueCode = ''; $script:Report.ActionRequired = ''; $script:Report.NatsStatus = ''; $script:Report.NatsInstalled = ''
+            $state = [ordered]@{
+                SchemaVersion=$Schema; RunId=$runId; RunDir=$runPath; Stage=$Stage; InstallerStarted=$false
+                Products='VB365'; OriginalVersion='15.19'; TargetVersion='15.19'
+                PgServiceName='postgresql-x64-15'; PsqlPath=$psqlFake; PgPort='5432'
+                NatsStage=$NatsStage; NatsRevertMode=$Mode; NatsNewBinaryStarted=$true
+                NatsPlan=[ordered]@{ OldVersion='2.10.22'; TargetVersion='2.10.28'; NewImagePath='"C:\new\nats-server.exe" -c "C:\c.conf"'; ProbeHost='127.0.0.1'; Port=4222; OldExe='C:\old\nats-server.exe'; RegBackup='C:\r.reg'; StoreBackup='C:\s' }
+            }
+            if ($Change) { $state['Change'] = $Change }
+            Write-AtomicJson -Path $statePath -InputObject $state
+            Write-AtomicJson -Path $markerPath -InputObject ([ordered]@{
+                SchemaVersion=$MarkerSchema; RunId=$runId; RunDir=$runPath; StateFile=$statePath; Stage=$Stage; InstallerStarted=$false })
+            try { Invoke-ExplicitRecovery -MarkerPath $markerPath -Cfg (Get-DefaultConfig) }
+            catch { if ($_.Exception.Message -ne 'COMPLETE-RUN-TEST-SENTINEL') { throw } }
+        }
+
+        Invoke-TestNatsRecover -NatsStage 'SWAPPED'
+        $a = @($script:Actions)
+        Check 'NATS switched: outcome'                $script:RecoveryCapture.Outcome 'RECOVERED_NATS_REVERTED'
+        Check 'NATS switched: exit 0'                 $script:RecoveryCapture.Code 0
+        Check 'NATS switched: put back before VB365'  ([array]::IndexOf($a, 'NATS-REVERT') -ge 0 -and [array]::IndexOf($a, 'NATS-REVERT') -lt [array]::IndexOf($a, 'RESTORE')) 'True'
+        Check 'NATS switched: NATS started before VB365' ([array]::IndexOf($a, 'START:nats-server') -lt [array]::IndexOf($a, 'RESTORE')) 'True'
+        Check 'NATS switched: jobs back on'           (@($a | Where-Object { $_ -like 'ENABLE:*' }).Count) 2
+        Check 'NATS switched: no PostgreSQL tuning'   ($a -contains 'TUNING') 'False'
+        Check 'NATS switched: PostgreSQL never stopped' ($a -contains 'STOP:postgresql-x64-15') 'False'
+        Check 'NATS switched: marker removed'         ($a -contains 'MARKER-REMOVED') 'True'
+        Check 'NATS switched: status'                 $script:Report.NatsStatus 'UPDATE_FAILED_REVERTED'
+
+        Invoke-TestNatsRecover -NatsStage 'VEEAM_STARTED' -Healthy $true -Services $runningAll
+        $a = @($script:Actions)
+        Check 'healthy on the new NATS: kept'         $script:RecoveryCapture.Outcome 'RECOVERED_NATS_UPDATED'
+        Check 'healthy on the new NATS: not reverted' ($a -contains 'NATS-REVERT') 'False'
+        Check 'healthy on the new NATS: committed'    (@($a | Where-Object { $_ -eq 'SAVE:COMPLETE:COMMITTED' }).Count) 1
+        Check 'healthy on the new NATS: jobs back on' (@($a | Where-Object { $_ -like 'ENABLE:*' }).Count) 2
+        Check 'healthy on the new NATS: version'      $script:Report.NatsInstalled '2.10.28'
+
+        Invoke-TestNatsRecover -NatsStage 'VEEAM_STARTED' -Healthy $false -Services $runningAll
+        Check 'unhealthy on the new NATS: put back'   "$($script:RecoveryCapture.Outcome) $($script:Actions -contains 'NATS-REVERT')" 'RECOVERED_NATS_REVERTED True'
+
+        Invoke-TestNatsRecover -Stage 'VERIFIED' -NatsStage 'COMMITTED'
+        $a = @($script:Actions)
+        Check 'verified NATS run: finished'           $script:RecoveryCapture.Outcome 'RECOVERED_NATS_UPDATED'
+        Check 'verified NATS run: services restored'  ($a -contains 'RESTORE') 'True'
+        Check 'verified NATS run: never reverted'     ($a -contains 'NATS-REVERT') 'False'
+        Check 'verified NATS run: no PostgreSQL tuning' ($a -contains 'TUNING') 'False'
+
+        Invoke-TestNatsRecover -NatsStage 'SWAPPED' -Services @{ 'postgresql-x64-15'='Running'; 'Veeam.Archiver.Service'='Running'; 'Veeam.Archiver.Proxy'='Stopped'; 'nats-server'='Running' }
+        Check 'Veeam started by hand: diagnostic only' $script:RecoveryCapture.Outcome 'RECOVERY_DIAGNOSTIC_ONLY'
+        Check 'Veeam started by hand: changes nothing' (@($script:Actions | Where-Object { $_ -in @('NATS-REVERT','RESTORE') -or $_ -like 'START:*' -or $_ -like 'ENABLE:*' }).Count) 0
+
+        Invoke-TestNatsRecover -NatsStage 'SWAPPED' -RevertProblem 'NATS could not be put back to 2.10.22: example failure'
+        Check 'revert fails: incomplete'              $script:RecoveryCapture.Outcome 'RECOVERY_INCOMPLETE'
+        Check 'revert fails: named'                   $script:Report.IssueCode 'NATS_RECOVERY_INCOMPLETE'
+        Check 'revert fails: VB365 stays down'        ($script:Actions -contains 'RESTORE') 'False'
+        Check 'revert fails: jobs stay off'           (@($script:Actions | Where-Object { $_ -like 'ENABLE:*' }).Count) 0
+        Check 'revert fails: says what to do'         ($script:Report.ActionRequired -match 'run -Recover') 'True'
+
+        Invoke-TestNatsRecover -NatsStage 'BACKED_UP'
+        Check 'nothing switched yet: restored'        $script:RecoveryCapture.Outcome 'RECOVERED_PREINSTALL'
+        Check 'nothing switched yet: no revert'       ($script:Actions -contains 'NATS-REVERT') 'False'
+        Check 'nothing switched yet: says NATS'       ($script:RecoveryCapture.Detail -match 'NATS was not changed') 'True'
+
+        Invoke-TestNatsRecover -Change ''
+        Check 'schema 2 without NATS is refused'      $script:RecoveryCapture.Outcome 'INVALID_RECOVERY_STATE'
+        Invoke-TestNatsRecover -Schema 1 -MarkerSchema 1
+        Check 'a NATS run with schema 1 is refused'   $script:RecoveryCapture.Outcome 'INVALID_RECOVERY_STATE'
+        Invoke-TestNatsRecover -MarkerSchema 1
+        Check 'marker and state schema must match'    $script:RecoveryCapture.Outcome 'INVALID_RECOVERY_STATE'
+        Check 'a refused state changes nothing'       @($script:Actions).Count 0
+
+        # A recovery that saves its state and then fails must leave a marker the next
+        # -Recover accepts: bound to the original run, never to this recovery's own stamp.
+        Remove-Item -LiteralPath Function:\Save-RecoveryState
+        $priorMarkerFile = Get-Variable -Name MarkerFile -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        $script:MarkerFile = $markerPath
+        $script:Stamp = '20261013-111111-111-9999'
+        function Restore-NatsInstallation { param([string] $WorkRootPath) Set-NatsStage 'REVERTING'; 'NATS could not be put back to 2.10.22: example failure' }
+        Invoke-TestNatsRecover -NatsStage 'SWAPPED'
+        $markerAfter = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+        Check 'a failed recovery keeps the marker on the original run' "$($markerAfter.RunId) $($markerAfter.Stage) $($markerAfter.SchemaVersion)" "$runId SERVICES_STOPPED 2"
+        Check 'the saved state records the revert attempt' (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).NatsStage 'REVERTING'
+        $script:MarkerFile = $priorMarkerFile
+    } finally {
+        Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+'--- NATS: the update run changes things in a safe order ---'
+$natsFlow = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-NatsOnlyUpdate' }, $true))[0].Extent.Text
+function Get-FlowAt([string] $Text) { $at = $natsFlow.IndexOf($Text); if ($at -lt 0) { throw "not in Invoke-NatsOnlyUpdate: $Text" }; $at }
+Check 'the download is hash-checked before it is opened' ((Get-FlowAt "'NATS_HASH_MISMATCH'") -lt (Get-FlowAt 'Expand-NatsPackage')) 'True'
+Check 'the package is tried before any job changes' ((Get-FlowAt "'NATS_STAGED_BINARY_FAILED'") -lt (Get-FlowAt 'Disable-VeeamManagedJobs')) 'True'
+Check 'disk space is checked before any job changes' ((Get-FlowAt "'LOW_DISK'") -lt (Get-FlowAt 'Disable-VeeamManagedJobs')) 'True'
+Check 'the outage is recorded before startup changes' ((Get-FlowAt "Save-RecoveryState -Stage 'SERVICES_STOPPED'") -lt (Get-FlowAt '@(Disable-VeeamServiceStartup)')) 'True'
+Check 'NATS stops after the Veeam services'   ((Get-FlowAt '$preferredStopOrder') -lt (Get-FlowAt "Stop-Service -Name 'nats-server'")) 'True'
+Check 'the backup is complete before the switch' ((Get-FlowAt "Set-NatsStage 'BACKED_UP'") -lt (Get-FlowAt "Set-NatsStage 'SWAP_STARTED'")) 'True'
+Check 'switch intent is saved before the new folder' ((Get-FlowAt "Set-NatsStage 'SWAP_STARTED'") -lt (Get-FlowAt 'New-Item -ItemType Directory -Path "$($natsPlan.NewDir)"')) 'True'
+Check 'the new folder exists before the service changes' ((Get-FlowAt 'New-Item -ItemType Directory -Path "$($natsPlan.NewDir)"') -lt (Get-FlowAt 'Set-NatsServicePath -PathName "$($natsPlan.NewImagePath)"')) 'True'
+Check 'the store flag is saved before NATS starts' ((Get-FlowAt 'Set-RecoveryProperty NatsNewBinaryStarted $true') -lt (Get-FlowAt "Start-Service -Name 'nats-server'")) 'True'
+Check 'NATS is verified alone before VB365 starts' ((Get-FlowAt "Set-NatsStage 'NATS_VERIFIED'") -lt (Get-FlowAt 'Restore-VeeamServiceState')) 'True'
+Check 'the VB365 start is recorded first'      ((Get-FlowAt "Set-NatsStage 'VEEAM_STARTED'") -lt (Get-FlowAt 'Restore-VeeamServiceState')) 'True'
+Check 'commit comes after the health checks'   ((Get-FlowAt 'VB365 did not come back healthy') -lt (Get-FlowAt "Set-RecoveryProperty NatsStage 'COMMITTED'")) 'True'
+Check 'maintenance is released after the commit' ((Get-FlowAt "Set-RecoveryProperty NatsStage 'COMMITTED'") -lt (Get-FlowAt 'Stop-Vb365MaintenanceBarrier')) 'True'
+Check 'jobs come back after maintenance ends'  ((Get-FlowAt 'Stop-Vb365MaintenanceBarrier') -lt (Get-FlowAt 'Enable-VeeamJobById')) 'True'
+Check 'a NATS run never stops PostgreSQL'      ($natsFlow -match 'Stop-Service -Name \$pgSvc') 'False'
+Check 'a NATS run never runs an installer'     ($natsFlow -match 'Start-Process') 'False'
+Check 'a NATS run never books a restart'       ($natsFlow -match 'Invoke-DelayedReboot|shutdown\.exe') 'False'
+Check 'a NATS run is recorded as schema 2'     ($natsFlow -match 'SchemaVersion\s+= 2') 'True'
+Check 'a NATS run needs no reboot'             ($natsFlow -match '\$script:Report\.RebootRequired = \$false') 'True'
+$natsCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-NatsOnlyUpdate' }, $true))
+Check 'the NATS run starts from one place'     $natsCalls.Count 1
+Check 'NATS goes only when PostgreSQL needs nothing' ($scriptText -match 'if \(\$natsDue -and \$versionComparison -ge 0\)') 'True'
+Check 'audit exits before the NATS run'        ($scriptText -match "(?s)if \(-not \`$Install\) \{\s+\`$natsMsg = .*?Complete-Run \`$code 'UPDATE_AVAILABLE' \`$natsMsg\s+\}\s+Invoke-NatsOnlyUpdate -Discovery \`$natsDiscovery") 'True'
+Check 'NATS is checked before PostgreSQL targets' ($scriptText.IndexOf("'STEP 6C - Check NATS (VB365 only)'") -lt $scriptText.IndexOf("'STEP 7 - Resolve target version'")) 'True'
+Check 'the service is never edited in the registry' ($scriptText -match 'Set-ItemProperty[^\r\n]*ImagePath') 'False'
+$rollbackText = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-Rollback' }, $true))[0].Extent.Text
+Check 'rollback puts NATS back before starting it' ($rollbackText.IndexOf('Restore-NatsInstallation') -ge 0 -and $rollbackText.IndexOf('Restore-NatsInstallation') -lt $rollbackText.IndexOf("Start-Service -Name 'nats-server'")) 'True'
+Check 'the report has the NATS fields'         ($scriptText -match "(?m)^\s+NatsInstalled\s+= ''" -and $scriptText -match "(?m)^\s+NatsTarget\s+= ''" -and $scriptText -match "(?m)^\s+NatsStatus\s+= ''" -and $scriptText -match "(?m)^\s+NatsDetail\s+= ''") 'True'
+Check 'a pending NATS update keeps exit 5 after a booked restart' ($scriptText -match '\$bookedCode = Get-PolicyExitCode -Eol \$script:EolBranch -UpdateAvailable \$natsDue -RebootRequired \$false') 'True'
 
 '--- Get-CfgValue StrictMode safety ---'
 $o = [pscustomobject]@{ a = 1 }
