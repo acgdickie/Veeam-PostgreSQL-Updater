@@ -1871,10 +1871,32 @@ function Start-Vb365MaintenanceBarrier {
     Set-RecoveryProperty Vb365MaintenanceSessionId $sessionId
     Set-RecoveryProperty Vb365MaintenancePending $false
     Save-RecoveryState -Stage $script:Stage -InstallerStarted $false
-    $verified = Get-VBORepositoryMaintenanceSession -Id $session.Id -ErrorAction Stop
-    if (-not $verified -or "$($verified.State)" -ne 'Running') {
+    # Start returns while VB365 is still Preparing: VB365 first lets repository work
+    # finish, for up to -WaitForSessionsTimeoutMinutes, and only then reports Running.
+    # A run that checked once gave up on a healthy session after one second. Poll for
+    # Running; a Preparing session is not yet a barrier. Any other state, or still
+    # preparing after the wait plus five minutes, fails and the rollback releases it.
+    $pollSeconds = 10
+    $maxPolls = [int][math]::Ceiling((($TimeoutMinutes + 5) * 60) / $pollSeconds)
+    $state = ''
+    $lastLogged = ''
+    for ($poll = 1; $poll -le $maxPolls; $poll++) {
+        $verified = Get-VBORepositoryMaintenanceSession -Id $session.Id -ErrorAction Stop
         $state = if ($verified) { "$($verified.State)" } else { 'missing' }
-        throw "VB365 maintenance session $sessionId did not reach Running (state=$state)"
+        if ($state -eq 'Running') { break }
+        if ($state -notin @('Initialized','Preparing')) {
+            $why = ''
+            if ($verified -and $verified.PSObject.Properties.Name -contains 'ErrorMessage' -and $verified.ErrorMessage) { $why = ": $($verified.ErrorMessage)" }
+            throw "VB365 maintenance session $sessionId did not reach Running (state=$state)$why"
+        }
+        if ($state -ne $lastLogged -or ($poll % 30) -eq 0) {
+            Write-Log "  VB365 maintenance session $sessionId is $state; waiting for VB365 to finish preparing it"
+            $lastLogged = $state
+        }
+        Start-Sleep -Seconds $pollSeconds
+    }
+    if ($state -ne 'Running') {
+        throw "VB365 maintenance session $sessionId was still $state after $($TimeoutMinutes + 5) minutes"
     }
     Write-Log "VB365 repository maintenance session $sessionId is Running; new repository operations are blocked" OK
     return $sessionId

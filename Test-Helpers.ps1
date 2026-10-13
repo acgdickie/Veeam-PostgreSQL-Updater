@@ -42,7 +42,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
         'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
-        'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier',
+        'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
         'Get-UnrestoredJobNames',
         'Write-AtomicText','Write-AtomicJson','Set-RecoveryProperty','Save-RecoveryState',
         'Invoke-ExplicitRecovery',
@@ -934,6 +934,53 @@ Check 'no products -> idle'                  @(Get-ActiveVeeamWork -Vbr $false -
     Check 'maintenance ownership selects the near session' "$($owned[0].Id)" '11111111-1111-1111-1111-111111111111'
     Check 'maintenance ownership rejects a later unrelated session' (@($owned | Where-Object { "$($_.Id)" -eq '22222222-2222-2222-2222-222222222222' }).Count) 0
     Check 'maintenance ownership rejects different repositories' (@($owned | Where-Object { "$($_.Id)" -eq '33333333-3333-3333-3333-333333333333' }).Count) 0
+}
+
+'--- VB365 maintenance: wait for Preparing to become Running ---'
+# Start-VBORepositoryMaintenanceSession returns while the session is still
+# Preparing. A run that checked once gave up on a healthy session after one second.
+& {
+    $priorStage = Get-Variable -Name Stage -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $priorState = Get-Variable -Name RecoveryState -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $script:Stage = 'JOBS_DISABLED'
+    $script:RecoveryState = $null
+    $script:MaintSeq = @()
+    $script:MaintPolls = 0
+    $script:MaintStopped = 0
+    function Get-VBORepository { [CmdletBinding()] param() @([pscustomobject]@{ Id='Repo-A' }, [pscustomobject]@{ Id='Repo-B' }) }
+    function Start-VBORepositoryMaintenanceSession { [CmdletBinding()] param($Repository, $WaitForSessionsTimeoutMinutes) [pscustomobject]@{ Id='44444444-4444-4444-4444-444444444444'; State='Preparing' } }
+    function Get-VBORepositoryMaintenanceSession {
+        [CmdletBinding()] param($Id)
+        if (-not $PSBoundParameters.ContainsKey('Id')) { return @() }
+        $i = $script:MaintPolls; $script:MaintPolls++
+        $row = if ($i -lt $script:MaintSeq.Count) { $script:MaintSeq[$i] } else { $script:MaintSeq[-1] }
+        return $row
+    }
+    function Stop-VBORepositoryMaintenanceSession { [CmdletBinding()] param($Id) $script:MaintStopped++ }
+    function Start-Sleep { [CmdletBinding()] param([int]$Seconds) }
+    function M($State, $Err = $null) { [pscustomobject]@{ Id='44444444-4444-4444-4444-444444444444'; State=$State; ErrorMessage=$Err } }
+
+    $script:MaintPolls = 0; $script:MaintSeq = @((M 'Preparing'), (M 'Preparing'), (M 'Running'))
+    Check 'Preparing then Running is accepted'    (Start-Vb365MaintenanceBarrier -TimeoutMinutes 1) '44444444-4444-4444-4444-444444444444'
+    Check 'it polled until Running'               $script:MaintPolls 3
+
+    $script:MaintPolls = 0; $script:MaintSeq = @((M 'Running'))
+    Check 'already Running is accepted at once'   (Start-Vb365MaintenanceBarrier -TimeoutMinutes 1) '44444444-4444-4444-4444-444444444444'
+    Check 'one poll when already Running'         $script:MaintPolls 1
+
+    $script:MaintPolls = 0; $script:MaintSeq = @((M 'Preparing'), (M 'Failed' 'Repository is locked'))
+    $err = ''; try { [void](Start-Vb365MaintenanceBarrier -TimeoutMinutes 1) } catch { $err = $_.Exception.Message }
+    Check 'a failed session stops the run'        ($err -match 'did not reach Running \(state=Failed\): Repository is locked') 'True'
+
+    $script:MaintPolls = 0; $script:MaintSeq = @((M 'Preparing'))
+    $err = ''; try { [void](Start-Vb365MaintenanceBarrier -TimeoutMinutes 1) } catch { $err = $_.Exception.Message }
+    Check 'stuck in Preparing gives up in time'   ($err -match 'was still Preparing after 6 minutes') 'True'
+    Check 'it gave up after the bounded polls'    $script:MaintPolls 36
+    Check 'the barrier itself never stops a session' $script:MaintStopped 0
+
+    if ($null -eq $priorStage) { Remove-Variable -Name Stage -Scope Script -ErrorAction SilentlyContinue } else { $script:Stage = $priorStage }
+    $script:RecoveryState = $priorState
+    Remove-Variable -Name Vb365MaintenanceSessionId, Vb365MaintenancePending -Scope Script -ErrorAction SilentlyContinue
 }
 
 $jobRecords = @(
