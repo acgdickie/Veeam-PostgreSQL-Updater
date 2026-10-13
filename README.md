@@ -30,15 +30,19 @@ Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 * **Major upgrades are hard blocked.** A branch change needs `pg_upgrade` or a Veeam
   configuration restore and is outside this script.
 * **No downgrades.** If the running version is equal to or newer than the resolved target,
-  the script changes nothing.
+  the script leaves PostgreSQL alone. On VB365, an `-Install` run still updates NATS when a
+  same-line NATS update is due.
 * **EOL branches stay on their branch.** The script warns, then targets the final minor
   published for that branch. It returns a distinct EOL exit code until a major-version
   migration is completed.
-* **Initial production topology.** Supported targets are either VBR-only or VB365-only,
-  backed directly by one local, standalone PostgreSQL instance dedicated to the detected
-  Veeam configuration/cache databases. Combined VBR+VB365 servers,
-  Veeam ONE co-residence, Enterprise Manager, remote/distributed databases and proxies,
-  and multiple or HA PostgreSQL instances return exit `11` for manual handling.
+* **Initial production topology.** Supported targets are either VBR-only (Enterprise Manager
+  beside VBR is allowed) or VB365-only, backed directly by one local, standalone PostgreSQL
+  instance dedicated to the detected Veeam configuration/cache databases. Combined VBR+VB365
+  servers, Veeam ONE co-residence, Enterprise Manager on a VB365 server without VBR or
+  with a database the script cannot read, remote/distributed databases and proxies, and
+  multiple or HA PostgreSQL instances return exit `11` for manual handling. A server with
+  Enterprise Manager and neither VBR nor VB365 is not a target (exit `0`, `NOT_APPLICABLE`). See [Leftover Enterprise
+  Manager records](#leftover-enterprise-manager-records).
 * **Windows only.** On the Veeam Linux appliance, PostgreSQL comes from Veeam Updater.
   Do not hand-patch those. The script refuses.
 * **Out of Veeam Support scope.** Both KBs cite Support Policy section 10. If it breaks,
@@ -51,8 +55,6 @@ Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 | `Update-VeeamPreReqs.ps1` | The update script. **The only file your RMM needs for the update** |
 | `Clear-StaleEnterpriseManagerRecord.ps1` | Separate manual tool. Checks, and can clear, a leftover Enterprise Manager connection record inside the VBR database. Not for the RMM. See [the separate tool](#the-separate-tool-clear-staleenterprisemanagerrecordps1) |
 | `Test-Helpers.ps1` | The tests for `Update-VeeamPreReqs.ps1`, plus the configuration backup check in `Clear-StaleEnterpriseManagerRecord.ps1`. For whoever edits the scripts, never for a server. See [Why `Test-Helpers.ps1` is there](#why-test-helpersps1-is-there) |
-| `Find-StuckVBMJobs.ps1` | Separate, read-only monitoring script. Finds stuck VBM (VB365) jobs and a stuck organisation sync, and names each one. For an RMM such as NinjaOne. See [Finding stuck VBM jobs](#finding-stuck-vbm-jobs-find-stuckvbmjobsps1) and its own repo, [acgdickie/Find-StuckVBMJobs](https://github.com/acgdickie/Find-StuckVBMJobs) |
-| `Test-FindStuckVBMJobs.ps1` | The tests for `Find-StuckVBMJobs.ps1`. For whoever edits it, never for a server |
 
 The settings are built into the script, so an RMM that uploads just the one file to a
 temp folder works.
@@ -130,6 +132,9 @@ is never a pass.
 
 ## Quick start
 
+On VBR 13 and VB365 8.6 the Veeam PowerShell modules need PowerShell 7, so run these with
+`pwsh` in place of `powershell` (see [How to run it from an RMM](#how-to-run-it-from-an-rmm)).
+
 Audit one server (changes nothing):
 
 ```powershell
@@ -142,7 +147,10 @@ Apply the update:
 powershell -ExecutionPolicy Bypass -File .\Update-VeeamPreReqs.ps1 -Install
 ```
 
-Recover captured state after an interrupted run, when the installer did not start:
+Recover an interrupted run. Before the installer started, it restores the captured state.
+After it, it finishes the run only when PostgreSQL proves healthy at the target version, and
+otherwise only reports (exit `40` or `50`). It also recovers an interrupted NATS update. See
+[If it goes wrong](#if-it-goes-wrong):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Update-VeeamPreReqs.ps1 -Recover
@@ -161,15 +169,15 @@ exact values:
 
 | Code | Meaning | Action |
 |---|---|---|
-| `0` | Healthy, with no outstanding RMM action | None |
-| `5` | Supported branch: audit found a PostgreSQL minor update or a NATS update | Schedule `-Install` through the rollout ring |
+| `0` | Healthy, with no outstanding RMM action. Also returned when no detected Veeam product uses a local PostgreSQL database, for example VBR on Microsoft SQL Server (`NOT_APPLICABLE`); after a NATS update (`NATS_UPDATED`); after an update where `-Reboot` booked the restart (`UPDATED_REBOOT_SCHEDULED`, see `RebootScheduledAt`); and after a successful `-Recover` (`RECOVERED_*`) or one with nothing to recover (`RECOVERY_NOT_NEEDED`) | None. After a booked restart, rerun audit to confirm |
+| `5` | Supported branch: audit found a PostgreSQL minor update or a NATS update. Also returned when `-Reboot` booked a restart and a NATS update is still due | Schedule `-Install` through the rollout ring |
 | `6` | Supported branch: update succeeded; reboot required | Schedule and verify a reboot |
 | `7` | PostgreSQL branch is EOL | Open or maintain a major-version migration ticket |
 | `8` | EOL branch and reboot required | Schedule a reboot and maintain the migration ticket |
-| `9` | EOL branch and minor update available | Schedule the minor update and maintain the migration ticket |
-| `10` | Safe transient condition | Retry later; no backup or restore was forcibly stopped |
+| `9` | EOL branch, and a PostgreSQL minor update or a NATS update available | Schedule `-Install` and maintain the migration ticket |
+| `10` | Safe transient condition, for example Veeam work did not finish in time, another run is in progress (`CONCURRENT_RUN`), or EnterpriseDB has not yet published the Windows installer for a new minor (`INSTALLER_NOT_PUBLISHED`; an audit can return this too) | Retry later; no backup or restore was forcibly stopped |
 | `11` | Unsupported or excluded topology | Handle manually; do not repeatedly retry as a transient failure |
-| `20` | Pre-flight failed | Investigate before retrying |
+| `20` | Pre-flight failed, or a NATS update failed and the old NATS was put back (`NATS_UPDATE_FAILED`) | Investigate before retrying |
 | `30` | EnterpriseDB page, download, size, or signature check failed, or the NATS download or its SHA256 check failed | Investigate the download path; nothing was installed |
 | `40` | **Post-change failure, unhealthy service, mandatory tuning failure, or recovery needs an operator** | **Page an operator and read the RMM issue fields** |
 | `50` | **PostgreSQL is missing, down, unqueryable, or reports the wrong version after change/tuning/recovery diagnosis** | **Page an operator immediately and use the recovery evidence** |
@@ -177,15 +185,24 @@ exact values:
 Failure codes `20`–`50` take precedence over informational EOL/reboot codes. For example,
 an EOL server with a post-update service failure returns `40`, not `8`.
 
-The exit code follows PostgreSQL. A run can return `0` (or `5`, `7`, `9`) while NATS was
-left alone for a reason worth a look. Alert on `NatsStatus` too: `HASH_CONFLICT` above all
-(it also fills `IssueCode` and `ActionRequired`), and also `REMOTE_CLIENTS` and
-`UNRECOGNISED_LAYOUT`.
+When NATS is left alone, the exit code does not show it: it follows PostgreSQL. A run can
+return `0` (or `5`, `7`, `9`) while NATS was left alone for a reason worth a look. Alert on
+`NatsStatus` too: `HASH_CONFLICT` above all (it always adds to `ActionRequired`, and sets
+`IssueCode=NATS_HASH_CONFLICT` when no other issue is set), and also `REMOTE_CLIENTS`, `UNRECOGNISED_LAYOUT`, `HASH_UNAVAILABLE` and
+`POLICY_UNKNOWN_VB365`: with any of these, a NATS update that may be due is not applied, run
+after run. `NOT_RUNNING` (`nats-server` stopped or disabled on a VB365 server) is worth a
+look too.
 
-The console summary and `last-result.json` include `ExitCode`, `IssueCode`,
+The console summary and `last-result.json` hold every report field, in this order:
+`Computer`, `Timestamp`, `Mode`, `VeeamProducts`, `PgMajor`, `PgInstalled`, `PgTarget`,
+`PgEol`, `NatsInstalled`, `NatsTarget`, `NatsStatus`, `NatsDetail`, `StaleEmRecord`,
+`Stage`, `Outcome`, `ExitCode`, `RebootRequired`, `RebootScheduledAt`, `IssueCode`,
 `ActionRequired`, `JobsLeftDisabled`, `UnhealthyServices`, `ServicesStarted`,
-`ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, `Detail`, and the NATS fields
-`NatsInstalled`, `NatsTarget`, `NatsStatus` and `NatsDetail`. `ServicesStarted` lists
+`ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, `Detail` and `LogPath`. When the run
+has a run folder (`-Install` creates one; `-Recover` uses the interrupted run's), the same
+result is also written to `result.json` there. `StaleEmRecord` is `present` when a leftover
+Enterprise Manager registry key was found, and `removed; backup <path>` after
+`-RemoveStaleEnterpriseManagerRecord` deleted it. `ServicesStarted` lists
 stopped automatic Veeam services the run started to rescue a failed configuration backup,
 `ConsolesClosed` lists the Veeam consoles it closed, and `Vb365SyncStuck` names any VB365
 organisation whose data sync is stuck: VB365 needs attention there.
@@ -196,11 +213,11 @@ Every summary line carries a `Stage=` field telling you exactly how far it got:
 
 | Stage | What it means |
 |---|---|
-| `UNTOUCHED` | No schedule, service, or PostgreSQL state was changed. Guaranteed. An `-Install` run may have closed an open Veeam console (see `ConsolesClosed`) |
+| `UNTOUCHED` | No schedule, service, or PostgreSQL state was changed. Guaranteed. An `-Install` run may have closed an open Veeam console (see `ConsolesClosed`), and `-RemoveStaleEnterpriseManagerRecord` may have removed a leftover registry key, in an audit too (see `StaleEmRecord`) |
 | `JOBS_DISABLED` | Schedules have been disabled; the installer has not started |
-| `SERVICES_STOPPED` | Services are stopped; the installer has not started |
+| `SERVICES_STOPPED` | Services are stopped; the PostgreSQL installer has not started. On a NATS update run, this stage also covers switching NATS, starting VB365 on it, and switching NATS back on failure: read `NatsStatus` |
 | `INSTALLING` | **Mid-change.** The installer may have started; automatic rollback is prohibited |
-| `VERIFIED` | PostgreSQL is at the target version |
+| `VERIFIED` | PostgreSQL is at the target version. On a NATS update run: NATS is at its target version, and PostgreSQL was not touched |
 | `COMPLETE` | Maintenance/state restoration completed. Inspect the exit code: exit `40` can still mean the completed recovery marker could not be removed |
 
 Codes `10`, `11`, `20`, and `30` normally mean nothing was changed or a safe pre-installer
@@ -217,7 +234,7 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | `-Recover` | off | Restore captured state from an interrupted run; if the installer finished and PostgreSQL proves healthy at the target version, finish the run |
 | `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
 | `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed and, on VB365, Veeam's help center (and GitHub when a NATS update is due) |
-| `-RemoveStaleEnterpriseManagerRecord` | off | Delete a proven-stale `Veeam Backup Reporting` registry key, after exporting and verifying a `.reg` backup |
+| `-RemoveStaleEnterpriseManagerRecord` | off | Delete a proven-stale `Veeam Backup Reporting` registry key, after exporting and verifying a `.reg` backup into the `logs` folder. Works in an audit run too, without `-Install`. `StaleEmRecord` reports the result; a failed removal is exit `20` (`STALE_EM_RECORD_REMOVE_FAILED`) |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
 RMM script or policy. The independent RMM owns the maintenance window, retries, the reboot unless
@@ -258,15 +275,16 @@ running. On those servers, invoke `pwsh.exe` instead of `powershell.exe`.
 ## Settings and version policy
 
 The configurable settings live **only inside the script**, near the top, under the banner
-`BUILT-IN SETTINGS - EDIT THESE`. Edit there, review the change, then re-upload the script
+`BUILT-IN SETTINGS`; the values themselves are the JSON block in `Get-DefaultConfig`, a
+few lines below it. Edit there, review the change, then re-upload the script
 to your RMM. There is no `-ConfigPath` parameter and no external settings file is read.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `jobWaitTimeoutMinutes` | `720` | Maximum time to wait for active Veeam work to finish naturally |
-| `installerTimeoutMinutes` | `120` | Maximum unattended wait for the EnterpriseDB installer; it is not forcibly killed on timeout |
-| `retentionDays` | `30` | Minimum age before completed logs and recovery sets become eligible for deletion |
-| `updateNats` | `true` | VB365 only. `true`: `-Install` also updates NATS when a same-line update is due. `false`: NATS is only reported (`NatsStatus=UPDATES_OFF`) |
+| `jobWaitTimeoutMinutes` | `720` | Maximum time each wait gives active Veeam work to finish naturally; one run can wait more than once. 1 to 10080; anything else stops `-Install` with exit `20` (`BAD_JOB_WAIT_TIMEOUT`) before anything changes |
+| `installerTimeoutMinutes` | `120` | Maximum unattended wait for the EnterpriseDB installer; it is not forcibly killed on timeout. 1 to 10080; anything else stops a PostgreSQL update with exit `20` (`BAD_INSTALLER_TIMEOUT`) before anything changes |
+| `retentionDays` | `30` | Minimum age before completed logs and recovery sets become eligible for deletion. A value below 1 is treated as `30` |
+| `updateNats` | `true` | VB365 only. `true`: `-Install` updates NATS when a same-line update is due, on a run where PostgreSQL needs nothing; when both are due, that run updates PostgreSQL and the next `-Install` run updates NATS. `false`: a due NATS update is only reported (`NatsStatus=UPDATES_OFF`) |
 
 The PostgreSQL target is **not** a maintained setting. On every default run, the script:
 
@@ -297,7 +315,9 @@ mandatory after every successful minor update.
 **`jobWaitTimeoutMinutes`** — the script polls until all detected backup, copy, restore,
 CDP, tape, agent, plug-in, configuration, protection-group, VB365 repository, and VB365
 organization-cache synchronization work is idle. It never calls a stop-job cmdlet. When
-the timeout expires, exit `10` tells the RMM to retry.
+the timeout expires before the outage, exit `10` tells the RMM to retry. After the update,
+work still running when schedules are due to be re-enabled is exit `40`
+(`FINAL_JOB_DRAIN_TIMEOUT`) instead, and the schedules stay disabled.
 
 **`installerTimeoutMinutes`** — bounds how long the RMM run waits for the unattended
 installer. A timed-out installer is not killed because it may be changing binaries. The
@@ -312,8 +332,10 @@ and verifies the target version is queryable. SQL application/tuning failure is 
 PostgreSQL down or unqueryable is exit `50`. There is no setting to skip tuning.
 
 **`retentionDays` is not only for script logs.** It covers transcript logs and completed
-recovery sets. A recovery set contains database dumps, roles, configuration copies, the
-cold data-directory copy, service/job state, tuning and installer logs. Unresolved runs
+recovery sets. A PostgreSQL recovery set contains database dumps, roles, configuration copies,
+the cold data-directory copy, service/job state, tuning and installer logs. A NATS run's
+set holds service/job state, the NATS service's registry key, its config file (which
+holds the NATS credentials), and a copy of the message store. Unresolved runs
 and the two newest completed recovery sets are retained regardless of age; older completed
 sets become eligible for deletion after `retentionDays`. Copy recovery evidence off-host
 if your operational policy requires protection from loss of the Veeam server itself.
@@ -324,6 +346,9 @@ Audit and install modes both inventory every job family the script knows how to 
 and check the corresponding job/restore/session APIs before an audit can report the server
 current. If a required API is missing, a query fails, an enabled-state property is unknown,
 or a job cannot be identified and later re-enabled by stable ID, the run fails closed.
+The one exception is a feature the Veeam licence edition does not include (for example
+application backup jobs below Enterprise Plus): Veeam refuses the query, so that family
+cannot have jobs, and the run logs a warning and treats it as empty.
 Protection-group rescans and their agent deployment work are checked through current and
 legacy VBR discovery-session types. VB365 whole-organization synchronization and each of
 its Users, Groups, GroupMembers, Sites, and Mailboxes parts are also fail-closed activity
@@ -355,9 +380,12 @@ the normal path. Anything unsaved in that console is lost. Veeam's own procedure
 also closes the console before stopping services. A Veeam Explorer is never closed,
 because it runs its own item-level restore. An open Explorer counts as active work: the
 run waits up to `jobWaitTimeoutMinutes` for it to close, then exits `10` as
-`JOB_WAIT_TIMEOUT` (or `JOB_DRAIN_TIMEOUT`, `FINAL_JOB_DRAIN_TIMEOUT`,
-`LAST_CHANCE_JOB_DRAIN_TIMEOUT` or `LAST_CHANCE_ACTIVITY_RACE` if it opens at a later
-check), with the Explorer listed in `Detail` as `UI:<process>:PID<id>`. `VEEAM_UI_OPEN`
+`JOB_WAIT_TIMEOUT` (or `JOB_DRAIN_TIMEOUT`, `FINAL_JOB_DRAIN_TIMEOUT` or
+`LAST_CHANCE_JOB_DRAIN_TIMEOUT` if it opens at a later check, or at once as
+`LAST_CHANCE_ACTIVITY_RACE` if it opens just before services stop), with the Explorer
+listed in `Detail` as `UI:<process>:PID<id>`. After the update, an Explorer still open
+when schedules are due to be re-enabled is exit `40` (`FINAL_JOB_DRAIN_TIMEOUT`), and the
+schedules stay disabled; during `-Recover` it is exit `40` (`RECOVERY_INCOMPLETE`). `VEEAM_UI_OPEN`
 covers only an Explorer, or a console that could not be closed, found by the last process
 check right before service shutdown. An audit run closes nothing.
 
@@ -377,7 +405,7 @@ required RMM action.
 
 Immediately before shutdown, the script enumerates every Windows service whose **service
 Name** matches `Veeam*`. It records each service's running state and exact startup type
-(`Automatic`, `Automatic (Delayed Start)`, `Manual`, or `Disabled`) in
+(`Automatic`, `AutomaticDelayedStart`, `Manual`, or `Disabled`) in
 `veeam-service-state.json` before changing anything. It then sets every captured service
 to `Disabled` and stops it, including the Veeam Management Agent. VB365 services retain
 their required stop order, and management-agent services are stopped last.
@@ -399,35 +427,50 @@ details for the RMM; it never terminates those sessions.
 
 ## What the script does when you pass -Install
 
-1. Checks that execution is Windows, elevated, local, and not blocked by an earlier marker.
-2. Detects VBR, VB365, Veeam ONE, and Enterprise Manager and enforces the initial
-   VBR-only/VB365-only supported topology.
-3. Requires one local standalone PostgreSQL installation, Windows service/cluster, and
+1. Checks the WorkRoot and takes a single-instance lock (a second copy running at the same
+   time returns exit `10`, `CONCURRENT_RUN`), then checks that execution is Windows,
+   elevated, local, and not blocked by an earlier marker.
+2. Detects VBR, VB365, Veeam ONE, and Enterprise Manager. Veeam ONE returns exit `11`, and
+   a server with neither VBR nor VB365 returns `0` (`NOT_APPLICABLE`). Supported: VBR alone,
+   VBR with Enterprise Manager, or VB365 alone. VBR with VB365, or Enterprise Manager with
+   VB365 instead of VBR (`ENTERPRISE_MANAGER_WITHOUT_VBR`), returns exit `11`.
+3. Requires exact VBR database-engine/connection registry values, and reads Enterprise
+   Manager's database the same way when it is installed beside VBR. For VB365 it parses
+   both `Config.xml` and `Proxy.xml`, validates controller and every persistent-cache
+   connection, and requires them all to resolve to the same local PostgreSQL service.
+4. Requires one local standalone PostgreSQL installation, Windows service/cluster, and
    direct Veeam database port; binds the service binary to the registry `Base Directory`;
-   proves `data_directory` and the registry/runtime major version match the installer
-   target; requires `WorkRoot` to be outside the data tree; and rejects standby,
-   streaming-replication, physical-slot, synchronous-standby, and Windows Failover
-   Cluster signals.
-4. Reads the **running** version with `SHOW server_version_num`, resolves the latest minor
-   on that same branch from `postgresql.org/versions.json`, and blocks major changes and
-   downgrades. EOL branches receive their final minor and a persistent EOL result.
-5. Resolves the exact Windows x64 installer link published on the
-   [EnterpriseDB PostgreSQL download page](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads).
-   It does not guess a CDN build suffix.
-6. Requires exact VBR database-engine/connection registry values. For VB365 it parses both
-   `Config.xml` and `Proxy.xml`, validates controller and every persistent-cache connection,
-   and requires them all to resolve to the same local PostgreSQL service. It inventories
-   the cluster and rejects unexpected non-Veeam databases or a pooler/port mismatch.
-7. Loads the product PowerShell module, validates VB365 proxy/maintenance topology,
+   reads the **running** version with `SHOW server_version_num`; proves `data_directory`
+   matches the installer target; requires `WorkRoot` to be outside the data tree;
+   inventories the cluster and rejects unexpected non-Veeam databases or a pooler/port
+   mismatch; and rejects standby, streaming-replication, physical-slot,
+   synchronous-standby, and Windows Failover Cluster signals.
+5. Loads the product PowerShell module, validates VB365 proxy/maintenance topology,
    inventories supported job families, and fails closed if schedules or activity cannot
    be safely enumerated and round-tripped. Install mode repeats this check before mutation.
+   It then proves the registry and running major versions match.
+6. On VB365 it checks NATS, read-only. It then resolves the latest minor on the running
+   branch from `postgresql.org/versions.json`, and blocks major changes and downgrades. EOL
+   branches receive their final minor and a persistent EOL result. If PostgreSQL is already
+   current (or newer), the run ends here, before any schedule, service or PostgreSQL
+   change, unless a same-line NATS update is due on VB365: then this run updates NATS
+   instead (see [Updating NATS (VB365)](#updating-nats-vb365)).
+7. Checks that Windows Script Host is enabled, pgAdmin is not running, and the WorkRoot
+   drive has room for the installer, dumps and cold copy (exit `20` otherwise). It then
+   looks for the Windows x64 installer on EnterpriseDB's file host, `get.enterprisedb.com`,
+   trying build suffixes `-5-` down to `-1-`, and reads the
+   [EnterpriseDB PostgreSQL download page](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads)
+   only when none answers. An installer not yet published is exit `10`
+   (`INSTALLER_NOT_PUBLISHED`), or `7` on an EOL branch.
 8. Waits for active jobs and restores to finish naturally. No job or restore is forcibly
    stopped; an open VBR/VB365 console is closed once it is the only thing left blocking;
    a timeout is exit `10` for the RMM to retry.
 9. Downloads the EDB installer, checks its advertised length, and requires a valid
    EnterpriseDB Authenticode signature.
 10. Disables and verifies every enabled managed schedule, writing durable recovery state
-   before each mutation, then re-checks that no work started in the race window.
+   before each mutation, then re-checks that no work started in the race window. On VB365
+   it then puts every repository into maintenance mode (exit `10`,
+   `VB365_MAINTENANCE_NOT_STARTED`, if it cannot).
 11. Generates the mandatory Veeam PostgreSQL tuning SQL while the product control service
     is healthy, then runs the VBR configuration backup when applicable, `pg_dump` for each
     Veeam database (including every VB365 `cache_<guid>` database), and `pg_dumpall -g`,
@@ -448,10 +491,15 @@ details for the RMM; it never terminates those sessions.
     and verifies the target version is queryable again.
 17. Restores exact startup types and starts every service that was originally running;
     a formerly stopped service that is now live is not stopped.
-18. Only when PostgreSQL, tuning, and services are healthy, re-enables and verifies exactly
-    the schedules changed by this run.
+18. Only when PostgreSQL, tuning, and services are healthy, releases VB365 maintenance mode
+    and waits for any new Veeam work to finish (if it does not, exit `40` as
+    `FINAL_JOB_DRAIN_TIMEOUT`, with schedules still disabled), then re-enables and verifies
+    exactly the schedules changed by this run.
 19. Returns exit `6` (or `8` on an EOL branch) with `RebootRequired=True` for the RMM to
-    reboot. With `-Reboot` it books the restart itself and returns `0` (or `7`).
+    reboot. With `-Reboot` it books the restart itself and returns `0` (or `7`),
+    or `5` (or `9`) when a NATS update is still due. If Veeam work has started by then, or
+    the last activity check or the booking fails, it books no restart and returns `6` (or
+    `8`). See [Rebooting](#rebooting).
 
 ## Updating NATS (VB365)
 
@@ -484,8 +532,8 @@ For VB365 8.6 the list is 2.10.18, 2.10.22, 2.10.28, 2.12.5 and 2.12.8 (October 
 
 | Installed | Result |
 |---|---|
-| 2.10.18 or 2.10.22 | Update to 2.10.28 |
-| 2.12.5, 2.12.6 or 2.12.7 | Update to 2.12.8 |
+| 2.10.x below 2.10.28 (for example 2.10.18, 2.10.22 or 2.10.25) | Update to 2.10.28 |
+| 2.12.x below 2.12.8 (for example 2.12.5, 2.12.6 or 2.12.7) | Update to 2.12.8 |
 | 2.10.28 or 2.12.8 | `CURRENT`, nothing to do |
 | 2.10.29, 2.12.9 or later on a line | `AHEAD`, left alone. Never downgraded |
 | 2.11.x, 2.14.x, any other line | `UNLISTED`, left alone |
@@ -525,7 +573,8 @@ check passes; anything the script cannot prove leaves NATS alone, with the reaso
 
 1. Downloads `nats-server-v<version>-windows-amd64.zip` from GitHub, checks its SHA256,
    extracts only `nats-server.exe`, and runs it with `--version` and `-t` (config check
-   only). Nothing has changed yet.
+   only). It also checks that the WorkRoot drive has room for a copy of the message store
+   plus 200 MB (`LOW_DISK`, exit `20`). Nothing has changed yet.
 2. Waits for VB365 work to finish, disables the jobs, and starts VB365 maintenance mode, as
    for a PostgreSQL update.
 3. Stops every `Veeam*` service (Proxy first), then NATS. PostgreSQL keeps running.
@@ -537,12 +586,15 @@ check passes; anything the script cannot prove leaves NATS alone, with the reaso
 6. Starts NATS on its own and checks the version clients get. Then starts VB365, waits 90
    seconds, and checks every service, PostgreSQL, the VB365 PowerShell connection, and,
    when VB365 was connected to NATS before, that it connects again.
-7. Ends maintenance mode and turns the jobs back on. Returns exit `0` (or `7` on an EOL
-   PostgreSQL branch) with `Outcome=NATS_UPDATED`. A NATS update needs no restart, so
-   `-Reboot` books none.
+7. Ends maintenance mode, waits for any new Veeam work to finish, and turns the jobs back on.
+   Returns exit `0` (or `7` on an EOL PostgreSQL branch) with `Outcome=NATS_UPDATED`. A NATS
+   update needs no restart, so `-Reboot` books none. If this step fails, NATS stays on the
+   new version (`NatsStatus=UPDATED`), schedules stay disabled, and the run returns exit `40`.
+   `-Recover` then finishes the run.
 
-**If something fails**, the old NATS goes back automatically and the run returns exit `20`
-(`NATS_UPDATE_FAILED`, `NatsStatus=UPDATE_FAILED_REVERTED`):
+**If step 5 or 6 fails**, before VB365 is verified healthy on the new version, the old NATS
+goes back automatically and the run returns exit `20` (`NATS_UPDATE_FAILED`,
+`NatsStatus=UPDATE_FAILED_REVERTED`):
 
 * Before VB365 used the new version, the service points back at the old program. If the new
   version started, the message store copy is put back too.
@@ -551,15 +603,20 @@ check passes; anything the script cannot prove leaves NATS alone, with the reaso
   version on the same line reads the store as it is.
 
 If the rollback itself fails, the script starts nothing on a half-switched NATS: the jobs
-stay disabled, Veeam services are not started again, and the run returns exit `40`. `ActionRequired` names the old program, the registry backup and the store
-copy. Fix the problem, then run `-Recover`: it tries the rollback again.
+stay disabled, Veeam services are not started again, and the run returns exit `40`.
+`ActionRequired` names the old program, the registry backup and the store copy. Fix the
+problem, then run `-Recover`: it tries the rollback again.
 
 `-Recover` on an interrupted NATS run puts the old NATS back, unless VB365 was already
 started on the new version and NATS answers at that version. Then it keeps the new version
-and finishes the run (`RECOVERED_NATS_UPDATED`). If someone started Veeam services by hand
-before VB365 ever used the new version, it changes nothing and asks an operator to stop them
-first. NATS runs write recovery state version 2, so an older copy of this script refuses to
-recover one instead of guessing.
+and finishes the run (`RECOVERED_NATS_UPDATED`). It also finishes a run that stopped in step
+7, after VB365 was verified on the new version. When the old NATS is back, the result is
+`RECOVERED_NATS_REVERTED` (`NatsStatus=UPDATE_FAILED_REVERTED`). When the run stopped before
+NATS was changed, it restores services and jobs only (`RECOVERED_PREINSTALL`,
+`NatsStatus=NOT_UPDATED`). All three return exit `0`. If someone started Veeam services by
+hand before VB365 ever used the new version, it changes nothing and asks an operator to stop
+them first. NATS runs write recovery state version 2, so an older copy of this script
+refuses to recover one instead of guessing.
 
 | `NatsStatus` | What it means |
 |---|---|
@@ -576,10 +633,11 @@ recover one instead of guessing.
 | `UPDATE_FAILED` | The run stopped while NATS was half-switched. Read `ActionRequired` |
 | `AHEAD` / `UNLISTED` | Not on Veeam's list, or nothing on its line to update to. Left alone |
 | `HASH_UNAVAILABLE` | Due, but the release's `SHA256SUMS` could not be read (for example a proxy blocks `github.com` or `release-assets.githubusercontent.com`), and no SHA256 is built in. Each run checks again |
-| `HASH_CONFLICT` | Due, but the release's `SHA256SUMS` disagrees with the SHA256 built into the script. The release may have been changed. Investigate before anything else. The exit code does not change, but `IssueCode` and `ActionRequired` say so |
+| `HASH_CONFLICT` | Due, but the release's `SHA256SUMS` disagrees with the SHA256 built into the script. The release may have been changed. Investigate before anything else. The exit code does not change. `ActionRequired` always says so. `IssueCode` says `NATS_HASH_CONFLICT` only when the run has no other `IssueCode`: any non-zero exit (for example `5` when PostgreSQL also has an update) already sets one |
 | `POLICY_UNKNOWN_VB365` | No NATS list for this VB365 release: the server's release could not be identified, or Veeam's page could not be read or describes another release, and the script has none built in. `NatsDetail` says which |
 | `REMOTE_CLIENTS` | Another machine is connected to NATS |
 | `UNRECOGNISED_LAYOUT` | NATS is not set up the way the script expects. `NatsDetail` says what |
+| (empty) | The run ended before the NATS check. A `-Recover` run fills it only when it recovers a NATS update |
 
 **Before the first NATS update**, run the audit on the VB365 servers and read `NatsStatus`
 and `NatsDetail`. The script was built from Veeam's documentation, not from a live VB365
@@ -588,12 +646,15 @@ NATS install: an `UNRECOGNISED_LAYOUT` result names the part that differs.
 ## Rebooting
 
 Veeam's KBs recommend restarting after the update. A successful supported-branch update
-returns exit `6`; an EOL update returns exit `8`. Both report `RebootRequired=True`.
+returns exit `6`; an EOL update returns exit `8`. Without `-Reboot`, both report
+`Outcome=UPDATED_REBOOT_REQUIRED` and `RebootRequired=True`.
 
 Without `-Reboot` the script never restarts the server. The RMM must reboot, verify
-`LastBootUpTime`, and rerun audit. Do not rerun the installer merely because exit `6` or
-`8` was returned. After a verified reboot, audit returns `0` on a supported branch or the
-persistent EOL result `7`.
+`LastBootUpTime`, and rerun audit. Do not rerun the installer merely because exit `6` or `8`
+was returned. After a verified reboot, audit returns `0` on a supported branch or the
+persistent EOL result `7`. On VB365, if the update run reported `NatsStatus=UPDATE_PENDING`,
+the audit returns `5` (or `9`) instead, because the NATS update is still due: schedule one
+more `-Install` run.
 
 **With `-Install -Reboot`**, after a fully successful update the script books a Windows
 restart `-RebootDelaySeconds` later (default `120`), as its very last action. The delay
@@ -605,13 +666,14 @@ none. When a PostgreSQL update booked a restart and a NATS update is still due, 
 returns exit `5` (or `9`) instead of `0` (or `7`), so the RMM schedules the next `-Install`
 run.
 
-The trade-off: once schedules are back on, VBR has no barrier that stops new work, so a
-job that starts inside the delay is interrupted by the restart. To keep that window small,
-the script checks for Veeam work once more just before booking. If a job or restore has
-started, an Explorer is open, or that check fails, it books no restart and returns
-`Outcome=UPDATED_REBOOT_NOT_SCHEDULED` with exit `6` (or `8`) for the RMM to reboot. An
-open Veeam console does not stop the restart. The script never restarts after a failed,
-partial or rolled-back run, or when no update was needed.
+The trade-off: once schedules are back on, VBR has no barrier that stops new work, so a job
+that starts inside the delay is interrupted by the restart. To keep that window small, the
+script checks for Veeam work once more just before booking. If a job or restore has started,
+an Explorer is open, that check fails, or `shutdown.exe` cannot book the restart, it books
+no restart (`IssueCode=REBOOT_NOT_SCHEDULED`) and returns
+`Outcome=UPDATED_REBOOT_NOT_SCHEDULED` with exit `6` (or `8`) for the RMM to reboot. An open
+Veeam console does not stop the restart. The script never restarts after a failed, partial
+or rolled-back run, or when no update was needed.
 
 ## Where the evidence lives
 
@@ -622,8 +684,11 @@ C:\ProgramData\VeeamPgUpdate\
   logs\
     VeeamPgUpdate_<server>_<timestamp>.log   full transcript
     last-result.json                          machine-readable result
+    stale-enterprise-manager-record-<timestamp>.reg   backup of a leftover key that
+                                              -RemoveStaleEnterpriseManagerRecord deleted
   runs\<timestamp>\
     recovery-state.json       versioned state used by -Recover
+    result.json               this run's result (logs\last-result.json is overwritten by each run)
     backup\
       <database>.dump        pg_dump custom format
       globals.sql            roles and grants
@@ -637,8 +702,12 @@ C:\ProgramData\VeeamPgUpdate\
     pg-service-state.json
     nats-service-state.json       when nats-server is installed
     pg-tuning.sql
+    postgresql-<version>-windows-x64.exe   the downloaded installer, removed on success
+    pg_installer_debug.log    the installer's debug trace
     installer-*.log
-  runs\<timestamp>\               a NATS update run instead holds:
+  runs\<timestamp>\               a NATS update run holds the same recovery-state.json,
+                                  result.json, disabled-jobs.json and *-service-state.json,
+                                  but no dumps, cold copy, tuning or installer files. Also:
     nats\                          the downloaded zip and the checked program, removed on success
     backup\
       Config.xml, Proxy.xml
@@ -671,10 +740,13 @@ claim it. Drive roots, UNC paths, relative paths, foreign content, forged
 sentinels, and reparse points are rejected without changing their contents or permissions.
 
 The script also checks `C:\temp\VeeamPgUpdate`, the work root earlier versions used, for a
-trusted changes-in-progress marker. It returns
-`LEGACY_WORKROOT_RECOVERY_REQUIRED` (exit 40) rather than hiding an interrupted run. Follow
-the RMM instruction to run `-Recover -WorkRoot C:\temp\VeeamPgUpdate`; after recovery,
-normal runs can use the default.
+trusted changes-in-progress marker. It returns `LEGACY_WORKROOT_RECOVERY_REQUIRED` (exit 40)
+rather than hiding an interrupted run. Follow the RMM instruction to run `-Recover -WorkRoot
+C:\temp\VeeamPgUpdate`; after recovery, normal runs can use the default. That `-Recover` run
+makes the same WorkRoot checks as any other run, on `C:\temp` too, so on a typical `C:\temp`
+it is refused (`WORKROOT_UNSAFE`, exit `20`). It runs only when `C:\temp` is owned by SYSTEM
+or an administrator and gives ordinary users no right to delete, re-permission or take over
+what is in it.
 
 A `C:\ProgramData\VeeamPgUpdate` folder that the script cannot prove it created (for
 example one left by an early version) is refused (`WORKROOT_UNSAFE`). If it holds no
@@ -697,14 +769,31 @@ dumps plus a full cold copy, and copy them off-host if required by your backup p
 Read `ExitCode`, `Stage`, `IssueCode`, `ActionRequired`, `JobsLeftDisabled`,
 `UnhealthyServices`, and `RecoveryRunDir` first.
 
-**Exit 40, Stage=INSTALLING** — the installer failed. Services are stopped, jobs disabled.
-Read `installer-*.log` in `RecoveryRunDir`. Do not use automatic database rollback.
+**Exit 40, Stage=INSTALLING** — the installer failed or timed out (`INSTALLER_FAILED`,
+`INSTALLER_TIMEOUT`). Services are stopped, jobs disabled. Read `installer-*.log` and
+`pg_installer_debug.log` in `RecoveryRunDir`. After `INSTALLER_TIMEOUT` the installer's own
+`install-postgresql*.log` and `bitrock_installer*.log` are not copied there yet: look in
+`%TEMP%` and `C:\Windows\Temp`. Do not use automatic database rollback.
+A run blocked by a leftover marker (`PRIOR_RUN_INCOMPLETE`), and a `-Recover` that refuses
+the marker or its recovery state, also report `Stage=INSTALLING` (a refused NATS recovery
+keeps the stage it recorded). Those runs changed nothing
+themselves; the server is as the earlier run left it. Read `Detail` and `ActionRequired`.
 
-**Exit 40, Stage=VERIFIED** (`UPDATED_WITH_PROBLEMS`) — PostgreSQL updated fine but a
+**Exit 40, Stage=VERIFIED** (`VEEAM_TUNING_FAILED`, `SERVICES_UNHEALTHY_JOBS_DISABLED`,
+`VB365_MAINTENANCE_RELEASE_FAILED`, `FINAL_SESSION_CHECK_FAILED`, `FINAL_JOB_DRAIN_TIMEOUT` or
+`JOB_REENABLE_FAILED`) — PostgreSQL updated fine but a
 mandatory tuner failed, a service did not come back, or a schedule could not be safely
 restored. The script leaves affected schedules disabled to prevent jobs running against
 an unhealthy stack. The RMM summary names the problem and the disabled schedules. It
 never reboots in this case.
+
+**Exit 40, Stage=JOBS_DISABLED or SERVICES_STOPPED** — the run stopped before the installer
+started (or, on VB365, before the new NATS was verified) and putting things back did not
+fully succeed, or a `-Recover` run could not finish. PostgreSQL itself was not changed, but
+it and the Veeam services may still be stopped and schedules disabled. On a NATS run, NATS
+may be half-switched: see [Updating NATS (VB365)](#updating-nats-vb365). `Detail` names the
+problem and `JobsLeftDisabled` the schedules. The marker stays. Fix the problem, then run
+`-Recover`.
 
 **Exit 50** — PostgreSQL is missing, will not start, is not queryable, or reports the wrong
 version after install/tuning, or `-Recover` diagnosed that emergency after the installer
@@ -728,19 +817,21 @@ Use `-Recover` for an interrupted run:
   and job state. Successful recovery returns exit `0` and removes the marker.
 * If the installer has started, recovery finishes the run only when everything proves it
   safe: PostgreSQL answers at the recorded target version, the installer is no longer
-  running, every Veeam service is still stopped, and the disabled-job record is readable.
-  It then applies the mandatory Veeam tuning, restores the captured service states, and
-  re-enables the jobs (`RECOVERED_POSTINSTALL`). If any check fails it changes nothing and
-  exits as `RECOVERY_DIAGNOSTIC_ONLY`, naming the check. A tuning failure leaves Veeam
-  down, as it does during `-Install`.
+  running, every Veeam service is still stopped, and the disabled-job record is readable. It
+  then applies the mandatory Veeam tuning, restores the captured service states, and
+  re-enables the jobs (`RECOVERED_POSTINSTALL`, exit `0`). It does not report
+  `RebootRequired=True`, so schedule the restart Veeam recommends through the RMM. If any
+  check fails it changes nothing and exits as `RECOVERY_DIAGNOSTIC_ONLY`, naming the check.
+  A tuning failure leaves Veeam down, as it does during `-Install`.
 * If active work appears during recovery, it waits naturally; no job or restore is forcibly
   stopped, though an open Veeam console is closed once it is the only thing left blocking.
 * If a VB365 maintenance start had an unknown client outcome, the script never adopts or
   stops a time/scope-matched session whose ID was not returned by its own start call. It
   leaves schedules and the marker in place for an operator if such a session exists.
-* If the installer started or may have started, `-Recover` is **diagnostic-only**. It
-  reports PostgreSQL/service state plus the actual recorded, unrestored job names and
-  returns `40` or `50` without rolling back database files or blindly re-enabling schedules.
+* If the installer started or may have started and any of those checks fails, `-Recover` is
+  **diagnostic-only** (`RECOVERY_DIAGNOSTIC_ONLY`). It reports PostgreSQL/service state plus
+  the actual recorded, unrestored job names and returns `40` or `50` without rolling back
+  database files or blindly re-enabling schedules.
 * `-Recover` cannot be combined with `-Install` or `-Reboot`.
 
 If rollback/state restoration succeeds but the completed marker cannot be removed, the
@@ -757,12 +848,17 @@ publishes in [KB1471](https://www.veeam.com/kb1471) — the same layout as VBR, 
 `VeeamBackupReporting`. Enterprise Manager's own services (`VeeamEnterpriseManagerSvc`,
 `VeeamRESTSvc`) are already covered, because every `Veeam*` service is stopped and restored.
 
-Two topologies are still excluded:
+Three topologies are still excluded:
 
-* **Enterprise Manager without VBR** (`ENTERPRISE_MANAGER_WITHOUT_VBR`, exit 11). That needs
-  its own profile for services and tuning.
+* **Enterprise Manager without VBR** (`ENTERPRISE_MANAGER_WITHOUT_VBR`, exit 11), on a
+  VB365 server. That needs its own profile for services and tuning. A server with
+  Enterprise Manager and neither VBR nor VB365 is not a target at all: exit `0`,
+  `Outcome=NOT_APPLICABLE`, and its PostgreSQL is not checked.
 * **A database the script cannot read** (`ENTERPRISE_MANAGER_DB_UNKNOWN`, exit 11) — a
-  pre-v12 registry layout, a missing value, or an unexpected engine name. Nothing is guessed.
+  pre-v12 registry layout, a missing value, an invalid port, or an unexpected engine name.
+  Nothing is guessed.
+* **An Enterprise Manager database on another server** (`REMOTE_DB`, exit 11), like any
+  remote Veeam database.
 
 If Enterprise Manager is on MS SQL, it is simply not a PostgreSQL target. Its services are
 still stopped and restarted with the rest.
@@ -787,6 +883,10 @@ logs that it found a leftover record.
 `-RemoveStaleEnterpriseManagerRecord` deletes that key only when the same run proved
 Enterprise Manager is absent. It exports a `.reg` backup into the log folder and verifies it
 first; no backup means no deletion. It never touches the Veeam configuration database.
+If the backup or the removal fails, the run stops with exit `20` and
+`IssueCode=STALE_EM_RECORD_REMOVE_FAILED`. The report field `StaleEmRecord` is `present`
+when a leftover key was found, and `removed; backup <path>` after the key is deleted. The
+backup is `stale-enterprise-manager-record-<timestamp>.reg` in the log folder.
 
 `Clear-StaleEnterpriseManagerRecord.ps1` covers the record inside the VBR database. See
 [the separate tool](#the-separate-tool-clear-staleenterprisemanagerrecordps1) below.
@@ -870,7 +970,9 @@ The initial production profile intentionally returns exit `11` for:
 
 * combined VBR+VB365 servers;
 * Veeam ONE co-residence;
-* Enterprise Manager co-residence, because it can have a separate configuration database;
+* Enterprise Manager on a VB365 server without VBR, or an Enterprise Manager database the
+  script cannot read or that is on another server. Enterprise Manager beside VBR is
+  supported (see [Leftover Enterprise Manager records](#leftover-enterprise-manager-records));
 * remote VBR/VB365 databases or distributed VB365 proxies;
 * multiple PostgreSQL installations, different Veeam database ports, or HA/clustered
   PostgreSQL;
@@ -900,31 +1002,3 @@ tested profile that protects every database, proxy, service, and schedule involv
 * **Pilot first.** VB365 support needs VB365 8.6 or later. The unit tests pass on both
   PowerShell editions. **Pilot each new product, version and PowerShell edition on one
   non-production server before fleet rollout.**
-
-## Finding stuck VBM jobs: `Find-StuckVBMJobs.ps1`
-
-A separate, read-only monitoring script. It finds stuck VBM (VB365) backup jobs, backup
-copy jobs and organisation syncs, names each one and says why, and exits `5` so an RMM
-can alert. It is not part of the update script, and the update script does not need it.
-
-The script is also published in its own repo, with its full documentation, example
-output and the NinjaOne setup:
-[acgdickie/Find-StuckVBMJobs](https://github.com/acgdickie/Find-StuckVBMJobs). The copy
-here is the same script. Its tests are kept here.
-
-`Test-FindStuckVBMJobs.ps1` is the safety net for changes to `Find-StuckVBMJobs.ps1`. It
-reads the real functions out of the script and runs the rules against fake VB365 objects.
-It also starts the real script with Windows PowerShell 5.1, the way an RMM does, against a
-fake VB365 module, a fake `ninjarmm-cli` and a missing or broken PowerShell 7. It needs no
-VB365. It creates throw-away files under `%TEMP%` only, and removes them again. Run it on
-both editions after every change, and copy the changed script to the other repo:
-
-```bash
-powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVBMJobs.ps1
-```
-
-```bash
-pwsh.exe -ExecutionPolicy Bypass -NoProfile -File .\Test-FindStuckVBMJobs.ps1
-```
-
-A pass ends with `RESULT: <n> passed, 0 failed` and exit code `0`.
