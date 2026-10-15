@@ -9,7 +9,7 @@ and NATS stays on its 2.x line. See [Updating NATS (VB365)](#updating-nats-vb365
 
 ## Why this exists
 
-Veeam does not patch PostgreSQL for you on Windows. Upgrading the Veeam product
+Veeam does not patch PostgreSQL or NATS for you on Windows. Upgrading the Veeam product
 leaves the database engine alone. Veeam says so in writing:
 
 > "When upgrading Veeam Backup for Microsoft 365, the previously deployed PostgreSQL
@@ -20,6 +20,8 @@ product itself has been upgraded, missing later PostgreSQL security and bug fixe
 
 Procedure follows [KB4386](https://www.veeam.com/kb4386) (VBR) and
 [KB4729](https://www.veeam.com/kb4729) (VB365).
+
+Should you follow the above procedure this can take alot of time and effort and as an MSP engineer I need to work efficiently and reliably across all our clients hence looked to do vi a script.
 
 ## Scope — read this
 
