@@ -50,6 +50,8 @@ Should you follow the above procedure this can take alot of time and effort and 
 * **Out of Veeam Support scope.** Both KBs cite Support Policy section 10. If it breaks,
   the backups this script takes are your only safety net.
 
+NOTE: This has been tested on up to 2 x v12, 2 x v13 VBR servers and 1 x v8.6 VBO servers (In prod after testing), I have sorted all issues found, but this is not to say there may not be other bugs or issues. If you experience any issues, please feel free to raise a PR or an issue. If you raise an issue, please include as much info as possible so I can replicate, test and resolve. 
+
 ## Files
 
 | File | What it is |
