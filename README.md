@@ -25,6 +25,16 @@ Should you follow the above procedure this can take alot of time and effort and 
 
 ## Scope — read this
 
+* **Initial production topology.** Supported targets are either VBR-only (Enterprise Manager
+  beside VBR is allowed) or VB365-only, backed directly by one local, standalone PostgreSQL
+  instance dedicated to the detected Veeam configuration/cache databases. Combined VBR+VB365
+  servers, Veeam ONE co-residence, Enterprise Manager on a VB365 server without VBR or
+  with a database the script cannot read, remote/distributed databases and proxies, and
+  multiple or HA PostgreSQL instances return exit `11` for manual handling. A server with
+  Enterprise Manager and neither VBR nor VB365 is not a target (exit `0`, `NOT_APPLICABLE`). See [Leftover Enterprise
+  Manager records](#leftover-enterprise-manager-records).
+* **Windows only.** On the Veeam Linux appliance, PostgreSQL comes from Veeam Updater.
+  Do not hand-patch those. The script refuses.
 * **Minor updates only, always to the latest release on the installed major.** The script
   reads the running PostgreSQL branch and selects its latest published minor. For example,
   15.2 becomes the latest 15.x release; it never becomes 16.x or 17.x. There is no target
@@ -37,16 +47,6 @@ Should you follow the above procedure this can take alot of time and effort and 
 * **EOL branches stay on their branch.** The script warns, then targets the final minor
   published for that branch. It returns a distinct EOL exit code until a major-version
   migration is completed.
-* **Initial production topology.** Supported targets are either VBR-only (Enterprise Manager
-  beside VBR is allowed) or VB365-only, backed directly by one local, standalone PostgreSQL
-  instance dedicated to the detected Veeam configuration/cache databases. Combined VBR+VB365
-  servers, Veeam ONE co-residence, Enterprise Manager on a VB365 server without VBR or
-  with a database the script cannot read, remote/distributed databases and proxies, and
-  multiple or HA PostgreSQL instances return exit `11` for manual handling. A server with
-  Enterprise Manager and neither VBR nor VB365 is not a target (exit `0`, `NOT_APPLICABLE`). See [Leftover Enterprise
-  Manager records](#leftover-enterprise-manager-records).
-* **Windows only.** On the Veeam Linux appliance, PostgreSQL comes from Veeam Updater.
-  Do not hand-patch those. The script refuses.
 * **Out of Veeam Support scope.** Both KBs cite Support Policy section 10. If it breaks,
   the backups this script takes are your only safety net.
 
@@ -54,9 +54,9 @@ Should you follow the above procedure this can take alot of time and effort and 
 
 | File | What it is |
 |---|---|
-| `Update-VeeamPreReqs.ps1` | The update script. **The only file your RMM needs for the update** |
+| `Update-VeeamPreReqs.ps1` | The update script. **The only file you needs for the update** |
 | `Clear-StaleEnterpriseManagerRecord.ps1` | Separate manual tool. Checks, and can clear, a leftover Enterprise Manager connection record inside the VBR database. Not for the RMM. See [the separate tool](#the-separate-tool-clear-staleenterprisemanagerrecordps1) |
-| `Test-Helpers.ps1` | The tests for `Update-VeeamPreReqs.ps1`, plus the configuration backup check in `Clear-StaleEnterpriseManagerRecord.ps1`. For whoever edits the scripts, never for a server. See [Why `Test-Helpers.ps1` is there](#why-test-helpersps1-is-there) |
+| `Test-Helpers.ps1` | The tests for `Update-VeeamPreReqs.ps1`, plus the configuration backup check in `Clear-StaleEnterpriseManagerRecord.ps1`. For testing only. See [Why `Test-Helpers.ps1` is there](#why-test-helpersps1-is-there) |
 
 The settings are built into the script, so an RMM that uploads just the one file to a
 temp folder works.
@@ -71,11 +71,6 @@ The checks read the real functions out of the script — not a copy. Run them un
 `powershell.exe` and `pwsh.exe`; the two editions behave differently and both are
 supported. Run from an elevated prompt: a run that is not elevated is never a pass (see
 below).
-
-### Why `Test-Helpers.ps1` is there
-
-`Test-Helpers.ps1` is the safety net for changes to `Update-VeeamPreReqs.ps1`. It is for
-whoever edits the script. Never copy it to a Veeam server or add it to the RMM.
 
 **What it does**
 
@@ -849,6 +844,11 @@ If rollback/state restoration succeeds but the completed marker cannot be remove
 result is exit `40`, `Stage=COMPLETE`, and `IssueCode=MARKER_REMOVE_FAILED`. Jobs are not
 reported as disabled when their durable records say they were restored. Confirm the
 completed state, then remove the stale marker under the operator change record.
+
+### Why `Test-Helpers.ps1` is there
+
+`Test-Helpers.ps1` is the safety net for changes to `Update-VeeamPreReqs.ps1`. It is for
+whoever edits the script. Never copy it to a Veeam server or add it to the RMM.
 
 ## Leftover Enterprise Manager records
 
