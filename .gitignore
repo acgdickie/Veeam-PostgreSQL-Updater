@@ -1,2 +1,6 @@
 # Local working files. Not part of the scripts.
 *.xlsx
+
+# NinjaOne edition: a local copy of the update script set up for NinjaOne, and the
+# script that builds it. Not published.
+NinjaOne/
